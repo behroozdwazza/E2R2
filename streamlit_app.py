@@ -59,16 +59,30 @@ def visible_case_base(case_base: pd.DataFrame) -> pd.DataFrame:
 
 
 def call_openai(api_key: str, model: str, prompt: str) -> str:
-    payload: Dict[str, Any] = {"model": model, "input": prompt}
+    if not api_key:
+        raise ValueError("No OpenAI API key was provided.")
+    payload: Dict[str, Any] = {"model": model, "input": prompt, "max_output_tokens": 700}
     if not model.startswith("gpt-5"):
         payload["temperature"] = 0.2
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=90,
+        )
+    except requests.exceptions.ReadTimeout as exc:
+        raise RuntimeError(
+            "The OpenAI request timed out. Try a faster model such as gpt-4.1-mini or gpt-5-mini, "
+            "reduce the number of retrieved cases, or rerun the request."
+        ) from exc
+    if not response.ok:
+        detail = response.text
+        try:
+            detail = response.json().get("error", {}).get("message", response.text)
+        except Exception:
+            pass
+        raise RuntimeError(f"OpenAI API request failed ({response.status_code}): {detail}")
     data = response.json()
     if data.get("output_text"):
         return data["output_text"]
@@ -78,6 +92,21 @@ def call_openai(api_key: str, model: str, prompt: str) -> str:
             if content.get("type") in {"output_text", "text"}:
                 chunks.append(content.get("text", ""))
     return "\n".join(chunks).strip()
+
+
+def secret_api_key() -> str:
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return str(st.secrets["OPENAI_API_KEY"])
+        if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+            return str(st.secrets["openai"]["api_key"])
+    except Exception:
+        return ""
+    return ""
+
+
+def resolved_api_key(input_key: str) -> str:
+    return input_key.strip() or secret_api_key()
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
@@ -93,8 +122,9 @@ def parse_json_response(text: str) -> Dict[str, Any]:
             return {}
 
 
-def model_select(key: str) -> str:
-    return st.selectbox("LLM model", OPENAI_LLM_MODELS, index=0, key=key)
+def model_select(key: str, default: str = "gpt-4.1-mini") -> str:
+    index = OPENAI_LLM_MODELS.index(default) if default in OPENAI_LLM_MODELS else 0
+    return st.selectbox("LLM model", OPENAI_LLM_MODELS, index=index, key=key)
 
 
 def infer_target_column(holdout: pd.DataFrame) -> str:
@@ -227,10 +257,22 @@ def lab_prompt(
 ) -> str:
     role = infer_llm_role(prediction_goal, target_column)
     excluded = set(BASELINE_COLUMNS) | {"row_index", target_column}
+    relevant = shap_scores[shap_scores["case_id"].isin(retrieved["case_id"])].copy()
+    if relevant.empty:
+        prompt_features = [c for c in row.index if c not in excluded][:20]
+    else:
+        prompt_features = (
+            relevant.groupby("feature", as_index=False)["abs_shap_score"]
+            .mean()
+            .sort_values("abs_shap_score", ascending=False)
+            .head(20)["feature"]
+            .tolist()
+        )
     feature_lines = []
-    for feature, value in row.items():
-        if feature in excluded:
+    for feature in prompt_features:
+        if feature in excluded or feature not in row.index:
             continue
+        value = row.get(feature)
         definition = lab_feature_definition(shap_scores, feature)
         suffix = f" ({definition})" if definition else ""
         feature_lines.append(f"- {feature}{suffix}: {value}")
@@ -286,7 +328,7 @@ Prediction goal:
 
 {baseline_block}
 
-Holdout case profile:
+Holdout case profile, limited to SHAP-relevant predictors from retrieved precedents:
 {chr(10).join(feature_lines)}
 
 Retrieved E2R2 precedent cases, top {neighbors}:
@@ -450,7 +492,7 @@ def main_pipeline_tab() -> None:
     row_index = st.selectbox("Holdout row", training.X_test.index.tolist(), key="main_holdout_row")
     neighbors = st.number_input("Retrieved cases", 1, 12, 5, key="main_neighbors")
     api_key = st.text_input("OpenAI API key", type="password", key="main_api_key")
-    model = model_select("main_model")
+    model = model_select("main_model", default="gpt-4.1-mini")
     if st.button("Predict selected holdout case"):
         holdout_row = training.X_test.loc[row_index]
         retrieved = retrieve_similar_cases(training, case_base, holdout_row, k=int(neighbors))
@@ -465,8 +507,19 @@ def main_pipeline_tab() -> None:
             prediction_goal=results["prediction_goal"],
         )
         st.text_area("Prepared prompt", prompt, height=320)
-        if api_key:
-            st.text_area("LLM response", call_openai(api_key, model, prompt), height=220)
+        key = resolved_api_key(api_key)
+        if not key:
+            st.warning("Enter an OpenAI API key, or add OPENAI_API_KEY to Streamlit secrets, to generate the LLM response.")
+        else:
+            try:
+                with st.spinner("Generating LLM response..."):
+                    response_text = call_openai(key, model, prompt)
+                if response_text:
+                    st.text_area("LLM response", response_text, height=220)
+                else:
+                    st.warning("The OpenAI request completed but returned an empty response.")
+            except Exception as exc:
+                st.error(str(exc))
 
 
 def llm_lab_tab() -> None:
@@ -518,7 +571,7 @@ def llm_lab_tab() -> None:
     )
 
     api_key = st.text_input("OpenAI API key", type="password", key="lab_api_key")
-    model = model_select("lab_model")
+    model = model_select("lab_model", default="gpt-4.1-mini")
     prediction_goal = st.text_area("Prediction goal", key="lab_prediction_goal")
     include_baseline = st.checkbox("Include baseline model signal in prompt", value=True)
     neighbors = st.number_input("Retrieved cases", 1, 12, 5, key="lab_neighbors")
@@ -527,25 +580,45 @@ def llm_lab_tab() -> None:
     if mode == "Individual":
         row_index = st.selectbox("Holdout row", lab["holdout"]["row_index"].tolist())
         if st.button("Generate LLM prediction"):
-            result = run_lab_prediction(
-                row_index, lab, api_key, model, prediction_goal, include_baseline, int(neighbors)
-            )
-            st.dataframe(pd.DataFrame([{k: v for k, v in result.items() if k not in {"prompt", "llm_raw_response"}}]))
-            st.text_area("Prompt", result["prompt"], height=320)
-            st.text_area("Raw LLM response", result["llm_raw_response"], height=220)
+            key = resolved_api_key(api_key)
+            if not key:
+                st.warning("Enter an OpenAI API key, or add OPENAI_API_KEY to Streamlit secrets, to generate predictions.")
+            else:
+                try:
+                    with st.spinner("Generating LLM prediction..."):
+                        result = run_lab_prediction(
+                            row_index, lab, key, model, prediction_goal, include_baseline, int(neighbors)
+                        )
+                    st.dataframe(pd.DataFrame([{k: v for k, v in result.items() if k not in {"prompt", "llm_raw_response"}}]))
+                    st.text_area("Prompt", result["prompt"], height=320)
+                    st.text_area("Raw LLM response", result["llm_raw_response"], height=220)
+                except Exception as exc:
+                    st.error(str(exc))
     else:
         c1, c2 = st.columns(2)
         offset = c1.number_input("Start after first rows", 0, len(lab["holdout"]) - 1, 0)
         limit = c2.number_input("Number of rows", 1, len(lab["holdout"]), 25)
         if st.button("Run batch"):
-            rows = lab["holdout"]["row_index"].iloc[int(offset) : int(offset) + int(limit)].tolist()
-            results = [
-                run_lab_prediction(row, lab, api_key, model, prediction_goal, include_baseline, int(neighbors))
-                for row in rows
-            ]
-            result_df = pd.DataFrame(results)
-            st.session_state["lab_batch"] = result_df
-            st.dataframe(result_df.drop(columns=["prompt", "llm_raw_response"], errors="ignore"), use_container_width=True)
+            key = resolved_api_key(api_key)
+            if not key:
+                st.warning("Enter an OpenAI API key, or add OPENAI_API_KEY to Streamlit secrets, to run a batch.")
+            else:
+                rows = lab["holdout"]["row_index"].iloc[int(offset) : int(offset) + int(limit)].tolist()
+                results = []
+                progress = st.progress(0)
+                status = st.empty()
+                try:
+                    for i, row in enumerate(rows, start=1):
+                        status.write(f"Generating prediction {i} of {len(rows)}")
+                        results.append(
+                            run_lab_prediction(row, lab, key, model, prediction_goal, include_baseline, int(neighbors))
+                        )
+                        progress.progress(int(i / max(len(rows), 1) * 100))
+                    result_df = pd.DataFrame(results)
+                    st.session_state["lab_batch"] = result_df
+                    st.dataframe(result_df.drop(columns=["prompt", "llm_raw_response"], errors="ignore"), use_container_width=True)
+                except Exception as exc:
+                    st.error(str(exc))
         if "lab_batch" in st.session_state:
             st.download_button(
                 "Download batch predictions",
