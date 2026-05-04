@@ -61,7 +61,17 @@ def visible_case_base(case_base: pd.DataFrame) -> pd.DataFrame:
 def call_openai(api_key: str, model: str, prompt: str) -> str:
     if not api_key:
         raise ValueError("No OpenAI API key was provided.")
-    payload: Dict[str, Any] = {"model": model, "input": prompt, "max_output_tokens": 700}
+    if "pro" in model:
+        max_output_tokens = 4000
+    elif model.startswith("gpt-5"):
+        max_output_tokens = 1800
+    else:
+        max_output_tokens = 900
+    payload: Dict[str, Any] = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": max_output_tokens,
+    }
     if not model.startswith("gpt-5"):
         payload["temperature"] = 0.2
     try:
@@ -91,7 +101,18 @@ def call_openai(api_key: str, model: str, prompt: str) -> str:
         for content in item.get("content", []):
             if content.get("type") in {"output_text", "text"}:
                 chunks.append(content.get("text", ""))
-    return "\n".join(chunks).strip()
+    text = "\n".join(chunks).strip()
+    if text:
+        return text
+
+    status = data.get("status", "unknown")
+    incomplete = data.get("incomplete_details") or {}
+    error = data.get("error") or {}
+    reason = incomplete.get("reason") or error.get("message") or "No visible text was returned."
+    raise RuntimeError(
+        f"The model returned no visible LLM output. Status: {status}. Reason: {reason}. "
+        f"For pro reasoning models, try again, use fewer retrieved cases, or use gpt-4.1-mini / gpt-5-mini for interactive runs."
+    )
 
 
 def secret_api_key() -> str:
@@ -493,6 +514,8 @@ def main_pipeline_tab() -> None:
     neighbors = st.number_input("Retrieved cases", 1, 12, 5, key="main_neighbors")
     api_key = st.text_input("OpenAI API key", type="password", key="main_api_key")
     model = model_select("main_model", default="gpt-4.1-mini")
+    if "pro" in model:
+        st.info("Pro models can take several minutes and may be unreliable for interactive Streamlit runs. For quick experiments, use gpt-4.1-mini, gpt-5-mini, or gpt-5.4-mini.")
     if st.button("Predict selected holdout case"):
         holdout_row = training.X_test.loc[row_index]
         retrieved = retrieve_similar_cases(training, case_base, holdout_row, k=int(neighbors))
@@ -572,6 +595,8 @@ def llm_lab_tab() -> None:
 
     api_key = st.text_input("OpenAI API key", type="password", key="lab_api_key")
     model = model_select("lab_model", default="gpt-4.1-mini")
+    if "pro" in model:
+        st.info("Pro models can take several minutes and may be unreliable for interactive Streamlit runs. For quick experiments, use gpt-4.1-mini, gpt-5-mini, or gpt-5.4-mini.")
     prediction_goal = st.text_area("Prediction goal", key="lab_prediction_goal")
     include_baseline = st.checkbox("Include baseline model signal in prompt", value=True)
     neighbors = st.number_input("Retrieved cases", 1, 12, 5, key="lab_neighbors")
