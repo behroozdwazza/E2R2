@@ -23,15 +23,12 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8775
 
 OPENAI_LLM_MODELS = [
-    ("gpt-5.1", "GPT-5.1"),
-    ("gpt-5.4-mini", "GPT-5.4 mini"),
-    ("gpt-5", "GPT-5"),
-    ("gpt-5-mini", "GPT-5 mini"),
-    ("gpt-5-nano", "GPT-5 nano"),
-    ("gpt-5-pro", "GPT-5 pro"),
-    ("gpt-4.1", "GPT-4.1"),
-    ("gpt-4.1-mini", "GPT-4.1 mini"),
-    ("gpt-4.1-nano", "GPT-4.1 nano"),
+    ("gpt-5.4-mini", "GPT-5.4 mini - low cost, strong general reasoning"),
+    ("gpt-5-mini", "GPT-5 mini - low cost, strong reasoning"),
+    ("gpt-5-nano", "GPT-5 nano - lowest cost, light reasoning"),
+    ("o3-mini", "o3-mini - moderate cost, dedicated reasoning"),
+    ("o4-mini", "o4-mini - moderate cost, fast o-series reasoning"),
+    ("gpt-4.1-mini", "GPT-4.1 mini - low cost, fastest baseline"),
 ]
 
 BASELINE_COLUMNS = {
@@ -52,7 +49,7 @@ STATE: Dict[str, Any] = {
     "case_row_positions": None,
     "retrieval_mode": "reconstructed exported features",
     "api_key": "",
-    "model": "gpt-5.1",
+    "model": "gpt-4.1-mini",
     "prediction_goal": "",
     "include_baseline_signal": True,
     "individual_result": None,
@@ -417,7 +414,7 @@ Return this JSON object:
 
 def call_openai(api_key: str, model: str, prompt: str) -> str:
     payload: Dict[str, Any] = {"model": model, "input": prompt}
-    if not model.startswith("gpt-5"):
+    if not model.startswith("gpt-5") and not model.startswith("o"):
         payload["temperature"] = 0.2
     response = requests.post(
         "https://api.openai.com/v1/responses",

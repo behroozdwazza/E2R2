@@ -26,15 +26,12 @@ from e2r2_pipeline import (
 
 
 OPENAI_LLM_MODELS = [
-    "gpt-5.1",
-    "gpt-5.4-mini",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-    "gpt-5-pro",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
+    ("gpt-5.4-mini", "GPT-5.4 mini - low cost, strong general reasoning"),
+    ("gpt-5-mini", "GPT-5 mini - low cost, strong reasoning"),
+    ("gpt-5-nano", "GPT-5 nano - lowest cost, light reasoning"),
+    ("o3-mini", "o3-mini - moderate cost, dedicated reasoning"),
+    ("o4-mini", "o4-mini - moderate cost, fast o-series reasoning"),
+    ("gpt-4.1-mini", "GPT-4.1 mini - low cost, fastest baseline"),
 ]
 
 BASELINE_COLUMNS = {
@@ -63,7 +60,7 @@ def call_openai(api_key: str, model: str, prompt: str) -> str:
         raise ValueError("No OpenAI API key was provided.")
     if "pro" in model:
         max_output_tokens = 4000
-    elif model.startswith("gpt-5"):
+    elif model.startswith("gpt-5") or model.startswith("o"):
         max_output_tokens = 1800
     else:
         max_output_tokens = 900
@@ -72,7 +69,7 @@ def call_openai(api_key: str, model: str, prompt: str) -> str:
         "input": prompt,
         "max_output_tokens": max_output_tokens,
     }
-    if not model.startswith("gpt-5"):
+    if not model.startswith("gpt-5") and not model.startswith("o"):
         payload["temperature"] = 0.2
     try:
         response = requests.post(
@@ -144,8 +141,16 @@ def parse_json_response(text: str) -> Dict[str, Any]:
 
 
 def model_select(key: str, default: str = "gpt-4.1-mini") -> str:
-    index = OPENAI_LLM_MODELS.index(default) if default in OPENAI_LLM_MODELS else 0
-    return st.selectbox("LLM model", OPENAI_LLM_MODELS, index=index, key=key)
+    ids = [value for value, _ in OPENAI_LLM_MODELS]
+    index = ids.index(default) if default in ids else 0
+    selected = st.selectbox(
+        "LLM model",
+        OPENAI_LLM_MODELS,
+        index=index,
+        key=key,
+        format_func=lambda item: f"{item[1]} ({item[0]})",
+    )
+    return selected[0]
 
 
 def infer_target_column(holdout: pd.DataFrame) -> str:
