@@ -639,13 +639,15 @@ def llm_lab_tab() -> None:
                 status = st.empty()
                 try:
                     for i, row in enumerate(rows, start=1):
-                        status.write(f"Generating prediction {i} of {len(rows)}")
+                        status.write(f"Processing row {row}. Completed {i - 1} of {len(rows)} predictions.")
                         results.append(
                             run_lab_prediction(row, lab, key, model, prediction_goal, include_baseline, int(neighbors))
                         )
                         progress.progress(int(i / max(len(rows), 1) * 100))
+                        status.write(f"Completed {i} of {len(rows)} predictions.")
                     result_df = pd.DataFrame(results)
                     st.session_state["lab_batch"] = result_df
+                    status.success(f"Batch complete: {len(result_df)} predictions generated.")
                     st.dataframe(result_df.drop(columns=["prompt", "llm_raw_response"], errors="ignore"), use_container_width=True)
                 except Exception as exc:
                     st.error(str(exc))

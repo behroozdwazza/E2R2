@@ -8,6 +8,7 @@ import re
 import threading
 import traceback
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -54,8 +55,19 @@ STATE: Dict[str, Any] = {
     "include_baseline_signal": True,
     "individual_result": None,
     "batch_results": None,
+    "batch_status": {
+        "running": False,
+        "completed": 0,
+        "total": 0,
+        "current_row": "",
+        "message": "No batch is running.",
+        "error": "",
+        "finished": False,
+    },
     "error": None,
 }
+
+STATE_LOCK = threading.Lock()
 
 
 def esc(value: Any) -> str:
@@ -251,6 +263,15 @@ def prepare_loaded_data(
             "retrieval_mode": retrieval_mode,
             "individual_result": None,
             "batch_results": None,
+            "batch_status": {
+                "running": False,
+                "completed": 0,
+                "total": 0,
+                "current_row": "",
+                "message": "No batch is running.",
+                "error": "",
+                "finished": False,
+            },
         }
     )
 
@@ -473,6 +494,68 @@ def run_prediction_for_row(row_index: Any, neighbors: int) -> Dict[str, Any]:
     }
 
 
+def set_batch_status(**updates: Any) -> None:
+    with STATE_LOCK:
+        status = dict(STATE.get("batch_status") or {})
+        status.update(updates)
+        STATE["batch_status"] = status
+
+
+def get_batch_status() -> Dict[str, Any]:
+    with STATE_LOCK:
+        status = dict(STATE.get("batch_status") or {})
+    total = int(status.get("total") or 0)
+    completed = int(status.get("completed") or 0)
+    status["percent"] = int(round((completed / total) * 100)) if total else 0
+    return status
+
+
+def run_batch_job(row_indexes: List[Any], neighbors: int) -> None:
+    total = len(row_indexes)
+    results = []
+    set_batch_status(
+        running=True,
+        completed=0,
+        total=total,
+        current_row="",
+        message="Starting batch prediction...",
+        error="",
+        finished=False,
+        started_at=datetime.now().strftime("%H:%M:%S"),
+    )
+    try:
+        for completed, row_index in enumerate(row_indexes, start=1):
+            set_batch_status(
+                current_row=row_index,
+                message=f"Processing row {row_index} ({completed} of {total})...",
+            )
+            results.append(run_prediction_for_row(row_index, neighbors))
+            with STATE_LOCK:
+                STATE["batch_results"] = pd.DataFrame(results)
+            set_batch_status(
+                completed=completed,
+                message=f"Completed {completed} of {total} predictions.",
+            )
+        with STATE_LOCK:
+            STATE["batch_results"] = pd.DataFrame(results)
+        set_batch_status(
+            running=False,
+            completed=total,
+            current_row="",
+            message=f"Batch complete: {total} predictions generated.",
+            finished=True,
+            finished_at=datetime.now().strftime("%H:%M:%S"),
+        )
+    except Exception as exc:
+        set_batch_status(
+            running=False,
+            message="Batch stopped before completion.",
+            error=str(exc),
+            finished=True,
+            finished_at=datetime.now().strftime("%H:%M:%S"),
+        )
+
+
 def css() -> str:
     return """
     <style>
@@ -490,6 +573,7 @@ def css() -> str:
       textarea { min-height:90px; resize:vertical; }
       button, .button { border:0; border-radius:6px; padding:10px 14px; background:var(--accent); color:#fff; font-weight:650; text-decoration:none; cursor:pointer; display:inline-block; }
       button:hover, .button:hover { background:var(--accent-dark); }
+      button:disabled { background:#8aa3a0; cursor:wait; }
       .grid { display:grid; grid-template-columns:repeat(12, 1fr); gap:16px; align-items:end; }
       .span-2 { grid-column:span 2; } .span-3 { grid-column:span 3; } .span-4 { grid-column:span 4; } .span-5 { grid-column:span 5; } .span-6 { grid-column:span 6; } .span-8 { grid-column:span 8; } .span-12 { grid-column:span 12; }
       .muted { color:var(--muted); }
@@ -502,8 +586,51 @@ def css() -> str:
       .data-table th { background:var(--panel); position:sticky; top:0; z-index:1; }
       pre { white-space:pre-wrap; background:#f6f8fa; border:1px solid var(--line); border-radius:6px; padding:14px; max-height:420px; overflow:auto; }
       .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+      .progress-panel { border:1px solid var(--line); border-radius:6px; background:#f7f9fb; padding:14px; margin-top:14px; }
+      .progress-track { height:14px; background:#e6edf3; border-radius:999px; overflow:hidden; margin:10px 0 8px; }
+      .progress-fill { height:100%; width:0%; background:var(--accent); transition:width .25s ease; }
+      .progress-row { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; font-size:13px; }
+      .error-text { color:#b91c1c; }
       @media (max-width:820px) { header, main { padding-left:18px; padding-right:18px; } .grid { grid-template-columns:1fr; } .span-2,.span-3,.span-4,.span-5,.span-6,.span-8,.span-12 { grid-column:span 1; } }
     </style>
+    """
+
+
+def progress_script() -> str:
+    return """
+    <script>
+      const panel = document.getElementById("batch-progress");
+      async function refreshBatchStatus() {
+        if (!panel) return;
+        try {
+          const response = await fetch("/batch-status", { cache: "no-store" });
+          if (!response.ok) return;
+          const status = await response.json();
+          const fill = document.getElementById("batch-progress-fill");
+          const label = document.getElementById("batch-progress-label");
+          const count = document.getElementById("batch-progress-count");
+          const current = document.getElementById("batch-progress-current");
+          const error = document.getElementById("batch-progress-error");
+          const percent = Math.max(0, Math.min(100, Number(status.percent || 0)));
+          fill.style.width = `${percent}%`;
+          label.textContent = status.message || "Waiting for batch status...";
+          count.textContent = `${status.completed || 0} of ${status.total || 0}`;
+          current.textContent = status.current_row ? `Current row: ${status.current_row}` : "";
+          error.textContent = status.error ? `Error: ${status.error}` : "";
+          if (status.running) {
+            window.setTimeout(refreshBatchStatus, 1200);
+          } else if (status.finished && !window.batchCompletionReloaded) {
+            window.batchCompletionReloaded = true;
+            window.setTimeout(() => window.location.reload(), 1000);
+          }
+        } catch (_) {
+          window.setTimeout(refreshBatchStatus, 2000);
+        }
+      }
+      if (panel && panel.dataset.active === "true") {
+        refreshBatchStatus();
+      }
+    </script>
     """
 
 
@@ -525,6 +652,7 @@ def page(body: str) -> bytes:
     <div class="muted">Upload exported E2R2 files and run LLM predictions without retraining.</div>
   </header>
   <main>{status}{body}</main>
+  {progress_script()}
 </body>
 </html>"""
     return html_doc.encode("utf-8")
@@ -622,6 +750,23 @@ def batch_section() -> str:
     if STATE["holdout"] is None:
         return ""
     results = STATE.get("batch_results")
+    status = get_batch_status()
+    running = bool(status.get("running"))
+    progress_html = ""
+    if running or status.get("total"):
+        progress_html = f"""
+        <div id="batch-progress" class="progress-panel" data-active="{'true' if running else 'false'}">
+          <div class="progress-row">
+            <strong id="batch-progress-label">{esc(status.get('message', ''))}</strong>
+            <span id="batch-progress-count">{esc(status.get('completed', 0))} of {esc(status.get('total', 0))}</span>
+          </div>
+          <div class="progress-track"><div id="batch-progress-fill" class="progress-fill" style="width:{esc(status.get('percent', 0))}%"></div></div>
+          <div class="progress-row">
+            <span id="batch-progress-current" class="muted">{'Current row: ' + esc(status.get('current_row')) if status.get('current_row') else ''}</span>
+            <span id="batch-progress-error" class="error-text">{'Error: ' + esc(status.get('error')) if status.get('error') else ''}</span>
+          </div>
+        </div>
+        """
     result_html = ""
     if results is not None and not results.empty:
         result_html = f"""
@@ -637,10 +782,11 @@ def batch_section() -> str:
           <div class="span-3"><label>Start after first rows</label><input name="offset" type="number" min="0" value="0"></div>
           <div class="span-3"><label>Number of rows</label><input name="limit" type="number" min="1" value="25"></div>
           <div class="span-2"><label>Retrieved cases</label><input name="neighbors" type="number" min="1" max="12" value="5"></div>
-          <div class="span-12"><button type="submit">Run batch</button></div>
+          <div class="span-12"><button type="submit"{' disabled' if running else ''}>{'Batch is running' if running else 'Run batch'}</button></div>
         </div>
       </form>
       <p class="muted">For the entire holdout batch, set Number of rows to the full holdout count. Large runs can take time and use API credits.</p>
+      {progress_html}
       {result_html}
     </section>
     """
@@ -656,6 +802,9 @@ class LLMExperimentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/download":
             self.handle_download(parse_qs(parsed.query))
+            return
+        if parsed.path == "/batch-status":
+            self.respond_json(get_batch_status())
             return
         self.respond(200, home())
 
@@ -709,15 +858,31 @@ class LLMExperimentHandler(BaseHTTPRequestHandler):
 
     def handle_predict_batch(self) -> None:
         form = parse_post(self)
+        if get_batch_status().get("running"):
+            raise ValueError("A batch is already running. Wait for it to finish before starting another.")
+        if not STATE.get("api_key"):
+            raise ValueError("Enter and save your OpenAI API key first.")
         offset = int(float(form_get(form, "offset", 0)))
         limit = int(float(form_get(form, "limit", 25)))
         neighbors = int(float(form_get(form, "neighbors", 5)))
         holdout = STATE["holdout"]
         row_indexes = holdout["row_index"].iloc[offset : offset + limit].tolist()
-        results = []
-        for row_index in row_indexes:
-            results.append(run_prediction_for_row(row_index, neighbors))
-        STATE["batch_results"] = pd.DataFrame(results)
+        if not row_indexes:
+            raise ValueError("No holdout rows were selected for this batch.")
+        with STATE_LOCK:
+            STATE["batch_results"] = None
+        set_batch_status(
+            running=True,
+            completed=0,
+            total=len(row_indexes),
+            current_row="",
+            message="Starting batch prediction...",
+            error="",
+            finished=False,
+            started_at=datetime.now().strftime("%H:%M:%S"),
+        )
+        thread = threading.Thread(target=run_batch_job, args=(row_indexes, neighbors), daemon=True)
+        thread.start()
         self.redirect("/")
 
     def handle_download(self, query: Dict[str, Any]) -> None:
@@ -744,6 +909,14 @@ class LLMExperimentHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def respond_json(self, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: Any) -> None:
         return
