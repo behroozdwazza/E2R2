@@ -34,6 +34,8 @@ OPENAI_LLM_MODELS = [
     ("gpt-4.1-mini", "GPT-4.1 mini - low cost, fastest baseline"),
 ]
 
+RATIONALE_SIMPLIFIER_MODEL = "gpt-5-nano"
+
 BASELINE_COLUMNS = {
     "baseline_predicted_outcome",
     "baseline_positive_probability",
@@ -140,6 +142,40 @@ def parse_json_response(text: str) -> Dict[str, Any]:
             return {}
 
 
+def simplify_final_rationale(
+    api_key: str,
+    prediction_goal: str,
+    predicted_outcome: Any,
+    confidence_level: Any,
+    detailed_rationale: str,
+) -> str:
+    simplify_prompt = f"""You are rewriting a technical decision rationale for a general audience.
+
+Prediction goal:
+{prediction_goal or "Predict the outcome for this case."}
+
+Predicted outcome:
+{predicted_outcome}
+
+Confidence level:
+{confidence_level}
+
+Detailed rationale:
+{detailed_rationale}
+
+Rewrite this as one short, plain-language paragraph for a non-expert user.
+Requirements:
+- Keep the same conclusion and overall meaning.
+- Use everyday language.
+- Briefly explain the practical implications.
+- If the confidence is low or moderate, make the uncertainty understandable without sounding alarmist.
+- Do not mention SHAP, precedent retrieval, cosine similarity, Stage 1, Stage 2, baseline verification, or other technical framework terms.
+- Do not invent new facts, advice, or guarantees.
+- Return plain text only.
+"""
+    return call_openai(api_key, RATIONALE_SIMPLIFIER_MODEL, simplify_prompt).strip()
+
+
 def model_select(key: str, default: str = "gpt-4.1-mini") -> str:
     ids = [value for value, _ in OPENAI_LLM_MODELS]
     index = ids.index(default) if default in ids else 0
@@ -168,11 +204,58 @@ def feature_columns_for_retrieval(holdout: pd.DataFrame, target_column: str) -> 
     return [c for c in holdout.columns if c not in excluded]
 
 
+def original_feature_for_encoded_column(
+    encoded_column: str,
+    feature_columns: List[str],
+    categorical_columns: List[str],
+) -> str:
+    name = str(encoded_column)
+    if name in feature_columns:
+        return name
+    for column in sorted(categorical_columns, key=len, reverse=True):
+        if name == column or name.startswith(f"{column}_"):
+            return column
+    return name
+
+
+def shap_similarity_weights(
+    shap_scores: pd.DataFrame,
+    encoded_columns: List[str],
+    feature_columns: List[str],
+    categorical_columns: List[str],
+) -> Tuple[np.ndarray, str]:
+    if shap_scores is None or "feature" not in shap_scores.columns or "abs_shap_score" not in shap_scores.columns:
+        return np.ones(len(encoded_columns), dtype=float), "reconstructed unweighted features"
+    importance_frame = shap_scores[["feature", "abs_shap_score"]].copy()
+    importance_frame["feature"] = importance_frame["feature"].astype(str)
+    importance_frame["abs_shap_score"] = pd.to_numeric(importance_frame["abs_shap_score"], errors="coerce")
+    importance = (
+        importance_frame
+        .groupby("feature")["abs_shap_score"]
+        .mean()
+        .to_dict()
+    )
+    raw = np.asarray(
+        [
+            float(importance.get(original_feature_for_encoded_column(col, feature_columns, categorical_columns), 0.0))
+            for col in encoded_columns
+        ],
+        dtype=float,
+    )
+    raw = np.nan_to_num(np.abs(raw), nan=0.0, posinf=0.0, neginf=0.0)
+    if float(raw.sum()) <= 0:
+        return np.ones(len(encoded_columns), dtype=float), "reconstructed unweighted features"
+    weights = np.sqrt(raw / max(float(raw.mean()), 1e-12))
+    weights = np.clip(weights, 0.25, 4.0)
+    return weights.astype(float), "SHAP-weighted reconstructed features"
+
+
 def build_retrieval_vectors(
     holdout: pd.DataFrame,
     case_base: pd.DataFrame,
     feature_columns: List[str],
-) -> Tuple[np.ndarray, np.ndarray]:
+    shap_scores: pd.DataFrame,
+) -> Tuple[np.ndarray, np.ndarray, str]:
     features = holdout[feature_columns].copy()
     numeric_cols = [c for c in features.columns if pd.api.types.is_numeric_dtype(features[c])]
     categorical_cols = [c for c in features.columns if c not in numeric_cols]
@@ -187,13 +270,22 @@ def build_retrieval_vectors(
         if categorical_cols
         else pd.DataFrame(index=features.index)
     )
-    matrix = pd.concat([numeric, categorical], axis=1).to_numpy(dtype=float)
+    encoded = pd.concat([numeric, categorical], axis=1)
+    weights, weighting_label = shap_similarity_weights(
+        shap_scores,
+        [str(c) for c in encoded.columns.tolist()],
+        feature_columns,
+        categorical_cols,
+    )
+    matrix = encoded.to_numpy(dtype=float)
+    if len(weights) == matrix.shape[1]:
+        matrix = matrix * weights
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1
     holdout_vectors = matrix / norms
     row_to_position = {row_index: pos for pos, row_index in enumerate(holdout["row_index"].tolist())}
     case_positions = [row_to_position[idx] for idx in case_base["row_index"].tolist()]
-    return holdout_vectors, holdout_vectors[case_positions]
+    return holdout_vectors, holdout_vectors[case_positions], weighting_label
 
 
 def vector_columns(df: pd.DataFrame) -> List[str]:
@@ -246,6 +338,65 @@ def lab_feature_definition(shap_scores: pd.DataFrame, feature: str) -> str:
     return "" if matches.empty else str(matches.iloc[0])
 
 
+def normalize_label(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text.lower()
+
+
+def infer_positive_outcome_label(values: List[Any], prediction_goal: str) -> str:
+    labels = []
+    seen = set()
+    for value in values:
+        raw = str(value)
+        normalized = normalize_label(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        labels.append((raw, normalized))
+    if not labels:
+        return ""
+    for raw, normalized in labels:
+        if normalized == "1":
+            return raw
+    numeric = []
+    for raw, normalized in labels:
+        try:
+            numeric.append((raw, float(normalized)))
+        except ValueError:
+            pass
+    if len(numeric) == len(labels) and numeric:
+        return max(numeric, key=lambda item: item[1])[0]
+    risk_terms = ["attrition", "churn", "default", "fraud", "readmission", "dropout", "risk", "positive", "yes", "true"]
+    goal_text = normalize_label(prediction_goal)
+    for raw, normalized in labels:
+        if any(term in normalized for term in risk_terms):
+            return raw
+        if normalized and normalized in goal_text:
+            return raw
+    safe_terms = ["retained", "stay", "persist", "negative", "no", "false", "safe", "continue"]
+    safe_norms = {normalized for _, normalized in labels if any(term in normalized for term in safe_terms)}
+    if len(labels) == 2 and len(safe_norms) == 1:
+        for raw, normalized in labels:
+            if normalized not in safe_norms:
+                return raw
+    return labels[-1][0]
+
+
+def positive_class_specification(holdout: pd.DataFrame, target_column: str, prediction_goal: str) -> Tuple[str, str]:
+    values: List[Any] = []
+    if target_column and target_column in holdout.columns:
+        values = holdout[target_column].dropna().astype(str).unique().tolist()
+    elif "baseline_predicted_outcome" in holdout.columns:
+        values = holdout["baseline_predicted_outcome"].dropna().astype(str).unique().tolist()
+    label = infer_positive_outcome_label(values, prediction_goal or target_column) if values else ""
+    description = prediction_goal or (f"cases with outcome label {label}" if label else "the positive/risk outcome")
+    return str(label), description
+
+
 def lab_shap_alignment(row: pd.Series, retrieved: pd.DataFrame, shap_scores: pd.DataFrame) -> str:
     relevant = shap_scores[shap_scores["case_id"].isin(retrieved["case_id"])].copy()
     rows = []
@@ -274,14 +425,19 @@ def lab_shap_alignment(row: pd.Series, retrieved: pd.DataFrame, shap_scores: pd.
 
 def lab_prompt(
     row: pd.Series,
+    holdout: pd.DataFrame,
     retrieved: pd.DataFrame,
     shap_scores: pd.DataFrame,
     target_column: str,
     prediction_goal: str,
-    include_baseline: bool,
     neighbors: int,
 ) -> str:
     role = infer_llm_role(prediction_goal, target_column)
+    positive_class_label, positive_class_description = positive_class_specification(
+        holdout,
+        target_column,
+        prediction_goal,
+    )
     excluded = set(BASELINE_COLUMNS) | {"row_index", target_column}
     relevant = shap_scores[shap_scores["case_id"].isin(retrieved["case_id"])].copy()
     if relevant.empty:
@@ -305,71 +461,257 @@ def lab_prompt(
 
     peer_blocks = []
     for _, peer in retrieved.iterrows():
-        peer_shap = shap_scores[shap_scores["case_id"] == peer["case_id"]].sort_values("rank").head(8)
+        peer_shap = shap_scores[shap_scores["case_id"] == peer["case_id"]].sort_values("rank").head(5)
         units = (
             peer_shap["shap_output_units"].dropna().iloc[0]
             if "shap_output_units" in peer_shap.columns and not peer_shap["shap_output_units"].dropna().empty
             else "probability"
         )
         shap_lines = [
-            f"  - {item.feature}: value={item.value}, SHAP contribution={item.shap_score:.4f} ({units})"
+            f"  - {item.feature}: value={item.value}, SHAP contribution to positive-class probability={item.shap_score:.4f} ({units})"
             for item in peer_shap.itertuples()
         ]
         peer_blocks.append(
             "\n".join(
                 [
                     f"Case {peer.case_id}: outcome={peer.predicted_outcome}, "
-                    f"baseline confidence={peer.confidence:.3f}, retrieval similarity={peer.similarity:.3f}",
+                    f"retrieval similarity={peer.similarity:.3f}",
                     *shap_lines,
                 ]
             )
         )
 
-    baseline_block = (
-        "\n".join(
-            [
-                "Baseline model signal for this holdout case:",
-                f"- baseline_predicted_outcome: {row.get('baseline_predicted_outcome', '')}",
-                f"- baseline_positive_probability: {row.get('baseline_positive_probability', '')}",
-                f"- baseline_confidence: {row.get('baseline_confidence', '')}",
-            ]
-        )
-        if include_baseline
-        else "Baseline model signal for this holdout case: intentionally omitted for this experiment."
+    outcome_counts = retrieved["predicted_outcome"].astype(str).value_counts()
+    n_pos = (
+        int((retrieved["predicted_outcome"].astype(str) == str(positive_class_label)).sum())
+        if positive_class_label
+        else 0
     )
+    n_total = int(len(retrieved))
+    pos_share = (100.0 * n_pos / n_total) if n_total else 0.0
+    top_similarity = float(retrieved["similarity"].max()) if not retrieved.empty else 0.0
+    neighbor_count_lines = [
+        f"- {outcome}: {count} retrieved neighbors"
+        for outcome, count in outcome_counts.items()
+    ]
+    precedent_counts_block = "\n".join(
+        [
+            "Precedent outcome counts:",
+            f"- N={n_total}",
+            f"- n_pos={n_pos}",
+            f"- pos_share={pos_share:.1f}%",
+            *neighbor_count_lines,
+            f"- top retrieval similarity={top_similarity:.3f}",
+        ]
+    )
+    baseline_predicted_outcome = row.get("baseline_predicted_outcome", "")
+    baseline_confidence = row.get("baseline_confidence", "")
 
     return f"""{role}
 
-You are using the E2R2 framework: Explain, Embed, Retrieve, and Reason. E2R2 combines a baseline predictive model, SHAP feature attributions, similarity-based precedent retrieval, and professional reasoning.
-
-Important rules:
-- Do not use majority vote alone.
-- Interpret SHAP sign and magnitude explicitly; larger absolute SHAP values carry more weight.
-- Compare the holdout case with retrieved precedents on high-magnitude SHAP features.
-- If a baseline signal is provided, treat it as one additional signal. If omitted, do not infer it.
-- Return valid JSON only, with no Markdown.
+You are using the E2R2 framework: Explain, Embed, Retrieve, and Reason.
+E2R2 combines SHAP feature attributions, similarity-based precedent retrieval, and professional reasoning. The retrieved precedents come from a case base of correctly predicted, high-confidence holdout cases. Your job is to decide the outcome using precedent-based evidence, then verify that decision against an independent baseline machine-learning model's prediction.
 
 Prediction goal:
 {prediction_goal or f"Predict {target_column}."}
 
-{baseline_block}
+Positive class specification (CRITICAL — read this before any reasoning):
+The positive class label for this task is provided explicitly below as positive_class_label. Use this label exactly as given. Do not infer the positive class from the retrieved precedent outcomes or from any other signal in the prompt. In particular:
+- The positive class is NOT "whichever label the retrieved precedents happen to share." High-confidence retrieval can return all-one-class neighbors for either class, and that does not change which label is positive.
+- A precedent outcome value equal to positive_class_label means that precedent is a positive-class case. A precedent outcome value not equal to positive_class_label means that precedent is a negative-class case.
+- "pos_share" in the decision rule is the share of retrieved precedents whose outcome equals positive_class_label, regardless of which label that happens to be (0, 1, "churn", "default", etc.).
+- All SHAP values are explained against probability of positive_class_label, as stated in the SHAP interpretation section below.
 
-Holdout case profile, limited to SHAP-relevant predictors from retrieved precedents:
+positive_class_label: {positive_class_label}
+positive_class_description: {positive_class_description}
+
+Reasoning workflow:
+You will produce the final verdict in two internal stages. Complete Stage 1 fully before considering Stage 2. Do not allow knowledge of the baseline model's prediction (shown in the Stage 2 inputs) to influence your Stage 1 reasoning.
+
+=================================================================
+STAGE 1 — PRECEDENT-BASED REASONING
+=================================================================
+
+Reasoning guidance:
+Use your best professional judgment to predict the outcome from the evidence shown below: the holdout case profile, the retrieved precedent cases, their outcomes, their similarity scores, and their top SHAP predictors.
+
+Detailed comparison task:
+- Identify the most important predictors that recur across the retrieved precedents' top 5 SHAP predictors.
+- Start from the recurring top-predictor patterns, then compare the holdout case against the precedents predictor by predictor using the exact values shown when helpful.
+- Explain whether the holdout case matches the precedent pattern, differs in a meaningful way, or shows mixed evidence on those predictors.
+- Highlight critical differences on the strongest predictors, especially when the holdout case shows a protective pattern where positive precedents showed risk, or vice versa.
+- If several predictors reflect the same underlying issue, treat them as one cluster rather than counting them as separate concerns.
+- Use that comparison, together with precedent outcomes and similarity scores, to reach the Stage 1 verdict — following the decision rule below.
+
+Decision rule (apply before writing the Stage 1 rationale):
+1. Let N be the total number of retrieved precedents and let n_pos be the count of those precedents whose outcome equals positive_class_label (as specified at the top of the prompt — do not re-infer this from the precedent outcomes). Compute pos_share = n_pos / N, expressed as a percentage. If all retrieved precedents share an outcome that is not equal to positive_class_label, then n_pos = 0 and pos_share = 0%; this is a strong negative signal, not a positive one.
+2. If pos_share >= 60%, the default Stage 1 verdict is positive. You may only override this default to a negative verdict if ALL of the following are true:
+   (a) The holdout case shows a clearly protective pattern on the strongest recurring SHAP predictor (the one with the largest mean |SHAP|) — meaning the holdout value crosses into a clearly healthy range on that variable, not merely a relatively-better range than the precedent values.
+   (b) The holdout also shows a clearly protective pattern on at least one other top-3 recurring predictor.
+   (c) The holdout does not exhibit any late-stage disengagement or acute-risk signal of the kind described in the structural-risk checklist below.
+   If you override the default, state the override explicitly in the Stage 1 rationale and name each condition you relied on.
+3. If pos_share <= 20%, the default Stage 1 verdict is negative. You may only override to a positive verdict if the holdout shows a clear, high-leverage leading indicator of the positive outcome (e.g., a behavior, status, or value that is widely understood in the domain as a near-certain precursor of the outcome — see the structural-risk checklist below for how to recognize one).
+4. If pos_share is between 20% and 60% (exclusive of both bounds), treat as borderline and resolve using the structural-risk checklist below.
+
+Borderline structural-risk checklist (apply only when pos_share is in the borderline band between 20% and 60% exclusive, OR when pos_share is between 60% and 80% inclusive, OR when the top retrieval similarity across the retrieved neighbors is below 0.78):
+
+A "structural-risk marker" is a predictor value in the holdout case that, in domain knowledge or in the recurring SHAP pattern of the case base, is a strong leading indicator of the positive outcome on its own. Identify markers using the following heuristics in order:
+- Any predictor that appears in the top 5 SHAP list of at least 80% of the retrieved precedents, where the holdout's value matches the precedent cluster's risk-direction value (e.g., the same categorical level, or a numeric value in the same risk-side range).
+- Any predictor in the holdout case that, by standard domain understanding, indicates an actively unfolding adverse event, withdrawal of support, missed obligation, or break in a normally-continuous process. These are typically the highest-leverage markers even when not present in the retrieved SHAP lists.
+- Any predictor whose value sits past a well-understood absolute risk threshold for the domain (e.g., a performance or health metric below a level commonly treated as concerning), regardless of how the holdout compares to the precedent values.
+
+Count how many such markers are present in the holdout. If 2 or more markers are present, lean toward the positive verdict. If 0 or 1 markers are present, lean toward the negative verdict. Name explicitly in the Stage 1 rationale which markers triggered, which heuristic identified each, and which did not trigger.
+
+SHAP interpretation:
+- All SHAP values are explained against the probability of positive_class_label (as specified at the top of the prompt), not against each precedent's own outcome.
+- A positive SHAP contribution increases the modeled probability of positive_class_label; a negative SHAP contribution decreases it.
+- Larger absolute SHAP values indicate stronger model contributions.
+
+Cautions when comparing holdout values to precedent values:
+- A holdout value that is better than the precedent cluster but still in an absolute risk zone is NOT protective. For example, if the precedents have very extreme risk-side values on a key predictor and the holdout has a moderately-less-extreme but still risk-side value, treat this as a milder version of the same risk pattern, not as a protective signal.
+- Only call a difference "protective" when the holdout value crosses into a clearly healthy or low-risk range on that variable by standard domain understanding, not merely when it is relatively better than the neighbors. State the healthy range you are using when you invoke protection.
+- Late-stage or behavioral signals (e.g., a discontinuation, a missed step in a normally-continuous process, a withdrawal of support, an acute event) typically outweigh upstream profile differences. If such a signal is present in the holdout, it should generally not be overridden by a more favorable value on an upstream predictor.
+
+Stage 1 confidence calibration (apply after determining the Stage 1 verdict):
+- High: pos_share >= 80% AND top retrieval similarity >= 0.85 AND the holdout matches the precedent cluster on the strongest recurring SHAP predictor's absolute range (not just its direction). OR, for a negative verdict: pos_share = 0% AND no structural-risk-checklist markers are present AND top similarity >= 0.80.
+- Moderate: precedents and structural signals point the same direction, but one of the high-confidence conditions above is missing (e.g., similarity is lower, or the holdout's value on the strongest predictor sits in a softer-but-still-aligned range).
+- Low: precedent signal and structural-risk checklist disagree, OR top similarity < 0.75, OR pos_share is in the borderline band (between 20% and 60% exclusive) with mixed feature evidence, OR the decision rule above required an explicit override.
+
+At the end of Stage 1, internally fix three values before reading any Stage 2 input:
+- stage1_verdict (the positive or negative class label)
+- stage1_confidence (low | moderate | high)
+- stage1_rationale (a detailed paragraph as described in the JSON schema below)
+
+=================================================================
+STAGE 2 — BASELINE-MODEL VERIFICATION
+=================================================================
+
+Now consult the baseline machine-learning model's prediction shown in the Stage 2 inputs. The baseline model was trained independently of the precedent retrieval and SHAP attribution pipeline, so its prediction is a largely independent signal. When both signals agree, the Stage 1 verdict is reliable. When they disagree, the resolution depends on how confident the baseline is.
+
+Critical clarifications before applying the rules:
+- baseline_predicted_outcome is a HARD CLASS LABEL (e.g., 0 or 1, "positive" or "negative"). It is not a probability. Use it only as a label.
+- baseline_confidence is a number between 0.50 and 1.00 that expresses how confident the baseline is in the class it predicted. A baseline_confidence of 0.5163 still means the baseline predicts its stated class — just weakly. It does NOT mean the baseline is undecided between classes.
+- "Agreement" is a strict equality check between two labels. It does not depend on any probability or confidence value. baseline_confidence near 0.50 does NOT make agreement false.
+
+Step 1 — Determine agreement.
+Compare two values:
+- stage1_verdict (the class label you fixed at the end of Stage 1; e.g., 1)
+- baseline_predicted_outcome (the class label provided in the Stage 2 input; e.g., 1)
+
+If these two labels are identical, then agreement = TRUE. If they are different, agreement = FALSE. Do not consult baseline_confidence or any other value when determining agreement.
+
+Worked examples:
+- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_confidence = 0.52 → agreement = TRUE (both predict the same class; the low confidence does not change this).
+- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_confidence = 0.99 → agreement = TRUE.
+- stage1_verdict = 1, baseline_predicted_outcome = 0, baseline_confidence = 0.55 → agreement = FALSE.
+- stage1_verdict = 0, baseline_predicted_outcome = 1, baseline_confidence = 0.80 → agreement = FALSE.
+
+Step 2 — Compute baseline_p_positive (for output transparency only; do NOT use this in the verification rules).
+- If baseline_predicted_outcome equals positive_class_label, baseline_p_positive = baseline_confidence.
+- If baseline_predicted_outcome does not equal positive_class_label, baseline_p_positive = 1 - baseline_confidence.
+
+Step 3 — Apply the verification rules in order. Stop at the first rule that fires.
+
+Rule A — Agreement. If agreement is TRUE (as determined in Step 1), keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider baseline_confidence in this rule — agreement alone fires Rule A regardless of how confident or unconfident the baseline is.
+
+Rule B — Confident baseline override. If agreement is FALSE AND baseline_confidence is at least 0.70, override to match the baseline. final_verdict = baseline_predicted_outcome. final_confidence = moderate (never high under override, since two independent signals disagreed). This rule applies symmetrically — a confident baseline whose predicted label is not positive_class_label overrides a Stage 1 positive verdict toward the negative class, and a confident baseline whose predicted label equals positive_class_label overrides a Stage 1 negative verdict toward the positive class.
+
+Rule C — Weak baseline, keep Stage 1. If agreement is FALSE AND baseline_confidence is below 0.60, keep the Stage 1 verdict. final_verdict = stage1_verdict. final_confidence = stage1_confidence, but capped at moderate (downgrade high to moderate; leave moderate and low unchanged).
+
+Rule D — Borderline disagreement. If agreement is FALSE AND baseline_confidence is between 0.60 and 0.70 (inclusive on the lower bound, exclusive on the upper), keep the Stage 1 verdict but downgrade final_confidence to low. Note explicitly in the final rationale that the baseline model disagreed at borderline confidence.
+
+Do not invoke any rule other than the four above. Do not override based on the Stage 1 rationale text or the Stage 1 confidence — only the agreement check and the baseline_confidence value drive the verification.
+
+Final rationale composition:
+- If Rule A fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model agreed (state baseline_confidence). The note should affirm agreement even if baseline_confidence is low; a low-confidence agreement is still agreement.
+- If Rule B fired, the final rationale should keep the Stage 1 evidence summary but append a sentence explaining that the baseline model disagreed at confident strength (state baseline_confidence) and that the verification step adopted the baseline verdict.
+- If Rule C fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model disagreed at low confidence (state baseline_confidence) and was not strong enough to override.
+- If Rule D fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model disagreed at borderline confidence (state baseline_confidence), which was not sufficient to override but reduced confidence in the final verdict.
+
+=================================================================
+INPUTS
+=================================================================
+
+Holdout case profile:
 {chr(10).join(feature_lines)}
 
-Retrieved E2R2 precedent cases, top {neighbors}:
+Retrieved E2R2 precedent cases:
 {chr(10).join(peer_blocks)}
+
+Recurring top predictors across retrieved precedents:
+{lab_recurring_top_predictors(row, retrieved, shap_scores, per_case_top_k=5, top_n=5)}
 
 SHAP-weighted alignment summary across retrieved cases:
 {lab_shap_alignment(row, retrieved, shap_scores)}
 
+{precedent_counts_block}
+
+Baseline model output:
+- baseline_predicted_outcome: {baseline_predicted_outcome}
+- baseline_confidence: {float(baseline_confidence):.4f}
+
+=================================================================
+OUTPUT
+=================================================================
+
 Return this JSON object:
 {{
-  "predicted_outcome": "one of the domain labels",
-  "confidence_level": "low | moderate | high",
-  "rationale": "one professional paragraph grounded in E2R2 evidence"
+  "stage1_predicted_outcome": "one of the domain labels",
+  "stage1_confidence_level": "low | moderate | high",
+  "stage1_rationale": "one detailed professional paragraph that (a) compares the holdout case with the retrieved precedents on the recurring top SHAP predictors, (b) states N, n_pos, and pos_share, and names which branch of the Stage 1 decision rule applied, (c) lists which structural-risk-checklist markers were checked and which triggered when applicable, and (d) explains how that combined evidence led to the Stage 1 verdict",
+  "agreement": true | false,
+  "baseline_p_positive": <numeric value between 0 and 1>,
+  "verification_rule_applied": "A | B | C | D",
+  "final_predicted_outcome": "one of the domain labels",
+  "final_confidence_level": "low | moderate | high",
+  "final_rationale": "the Stage 1 rationale plus the appropriate verification note as described in the Final rationale composition section"
 }}
+
+Base the rationale on the evidence shown in the prompt. The true outcome is not provided for reasoning.
 """
+
+
+def lab_recurring_top_predictors(
+    row: pd.Series,
+    retrieved: pd.DataFrame,
+    shap_scores: pd.DataFrame,
+    per_case_top_k: int = 5,
+    top_n: int = 5,
+) -> str:
+    relevant = shap_scores[shap_scores["case_id"].isin(retrieved["case_id"])].copy()
+    if "rank" in relevant.columns:
+        relevant = relevant[relevant["rank"] <= per_case_top_k].copy()
+    if relevant.empty:
+        return "- No recurring top-predictor rows were available."
+    total_cases = max(int(retrieved["case_id"].nunique()), 1)
+    rows = []
+    for feature, group in relevant.groupby("feature"):
+        holdout_value = row.get(feature, "")
+        peer_values = group["value"].dropna().astype(str).value_counts().head(3)
+        mean_abs = float(group["abs_shap_score"].mean())
+        mean_shap = float(group["shap_score"].mean())
+        case_count = int(group["case_id"].nunique())
+        if mean_shap > 0:
+            direction = "usually increases positive-class probability"
+        elif mean_shap < 0:
+            direction = "usually decreases positive-class probability"
+        else:
+            direction = "has mixed overall direction"
+        definition = lab_feature_definition(shap_scores, feature)
+        suffix = f" ({definition})" if definition else ""
+        rows.append(
+            {
+                "case_count": case_count,
+                "mean_abs": mean_abs,
+                "line": (
+                    f"- {feature}{suffix}: appears in {case_count}/{total_cases} retrieved cases' top {per_case_top_k} predictors; "
+                    f"holdout={holdout_value}; precedent values={', '.join([f'{value} ({count})' for value, count in peer_values.items()])}; "
+                    f"mean |SHAP|={mean_abs:.4f}; {direction}"
+                ),
+            }
+        )
+    rows = sorted(rows, key=lambda item: (item["case_count"], item["mean_abs"]), reverse=True)[:top_n]
+    return "\n".join(item["line"] for item in rows)
 
 
 def run_lab_prediction(
@@ -378,7 +720,6 @@ def run_lab_prediction(
     api_key: str,
     model: str,
     prediction_goal: str,
-    include_baseline: bool,
     neighbors: int,
 ) -> Dict[str, Any]:
     holdout = lab["holdout"]
@@ -388,24 +729,33 @@ def run_lab_prediction(
     )
     prompt = lab_prompt(
         row,
+        holdout,
         retrieved,
         lab["shap_scores"],
         lab["target_column"],
         prediction_goal,
-        include_baseline,
         neighbors,
     )
     raw = call_openai(api_key, model, prompt)
     parsed = parse_json_response(raw)
+    final_predicted = parsed.get("final_predicted_outcome", parsed.get("predicted_outcome", ""))
+    final_confidence = parsed.get("final_confidence_level", parsed.get("confidence_level", ""))
+    final_rationale = parsed.get("final_rationale", parsed.get("rationale", ""))
     return {
         "row_index": row_index,
         "actual_outcome": row.get(lab["target_column"], ""),
         "baseline_predicted_outcome": row.get("baseline_predicted_outcome", ""),
         "baseline_confidence": row.get("baseline_confidence", ""),
-        "baseline_signal_in_prompt": include_baseline,
-        "llm_predicted_outcome": parsed.get("predicted_outcome", ""),
-        "llm_confidence_level": parsed.get("confidence_level", ""),
-        "llm_rationale": parsed.get("rationale", ""),
+        "baseline_signal_in_prompt": True,
+        "stage1_predicted_outcome": parsed.get("stage1_predicted_outcome", ""),
+        "stage1_confidence_level": parsed.get("stage1_confidence_level", ""),
+        "stage1_rationale": parsed.get("stage1_rationale", ""),
+        "agreement": parsed.get("agreement", ""),
+        "baseline_p_positive": parsed.get("baseline_p_positive", ""),
+        "verification_rule_applied": parsed.get("verification_rule_applied", ""),
+        "llm_predicted_outcome": final_predicted,
+        "llm_confidence_level": final_confidence,
+        "llm_rationale": final_rationale,
         "retrieval_mode": lab["retrieval_mode"],
         "retrieved_case_ids": ", ".join(retrieved["case_id"].astype(str).tolist()),
         "prompt": prompt,
@@ -500,6 +850,10 @@ def main_pipeline_tab() -> None:
     shap_table = results["shap_table"]
     st.subheader("Baseline Model")
     st.write(f"Selected model: **{training.best_run.name}**")
+    st.caption(
+        f"Retrieval uses {training.similarity_weighting}. All encoded predictor features receive equal "
+        "weight when the cosine similarity score is calculated."
+    )
     st.dataframe(pd.DataFrame([training.best_run.metrics]), use_container_width=True)
 
     st.subheader("Downloads")
@@ -542,10 +896,45 @@ def main_pipeline_tab() -> None:
             try:
                 with st.spinner("Generating LLM response..."):
                     response_text = call_openai(key, model, prompt)
-                if response_text:
-                    st.text_area("LLM response", response_text, height=220)
+                parsed = parse_json_response(response_text)
+                final_predicted = parsed.get("final_predicted_outcome", parsed.get("predicted_outcome", ""))
+                final_confidence = parsed.get("final_confidence_level", parsed.get("confidence_level", ""))
+                detailed_rationale = parsed.get("final_rationale", parsed.get("rationale", ""))
+                if final_predicted and final_confidence and detailed_rationale:
+                    simplified_rationale = detailed_rationale
+                    simplify_note = ""
+                    try:
+                        with st.spinner("Simplifying the explanation for general audiences..."):
+                            simplified = simplify_final_rationale(
+                                api_key=key,
+                                prediction_goal=results["prediction_goal"],
+                                predicted_outcome=final_predicted,
+                                confidence_level=final_confidence,
+                                detailed_rationale=detailed_rationale,
+                            )
+                        if simplified:
+                            simplified_rationale = simplified
+                            simplify_note = f"Simplified explanation generated with {RATIONALE_SIMPLIFIER_MODEL}."
+                    except Exception as exc:
+                        simplify_note = f"The prediction succeeded, but the plain-language rewrite step failed: {exc}"
+
+                    st.subheader("Prediction")
+                    c1, c2 = st.columns(2)
+                    c1.metric("Predicted outcome", str(final_predicted))
+                    c2.metric("Confidence level", str(final_confidence))
+                    st.subheader("Reasoning")
+                    st.write(simplified_rationale)
+                    if simplify_note:
+                        if simplify_note.startswith("The prediction succeeded"):
+                            st.warning(simplify_note)
+                        else:
+                            st.caption(simplify_note)
+                    with st.expander("Detailed rationale"):
+                        st.write(detailed_rationale)
+                    st.text_area("Raw LLM response", response_text, height=220)
                 else:
-                    st.warning("The OpenAI request completed but returned an empty response.")
+                    st.warning("The selected LLM returned a response, but the app could not extract the expected prediction fields.")
+                    st.text_area("Raw LLM response", response_text, height=220)
             except Exception as exc:
                 st.error(str(exc))
 
@@ -576,8 +965,9 @@ def llm_lab_tab() -> None:
             holdout_vectors, case_vectors = exact
             retrieval_mode = "exported training-pipeline vectors"
         else:
-            holdout_vectors, case_vectors = build_retrieval_vectors(holdout, case_base, feature_columns)
-            retrieval_mode = "reconstructed exported features"
+            holdout_vectors, case_vectors, retrieval_mode = build_retrieval_vectors(
+                holdout, case_base, feature_columns, shap_scores
+            )
         st.session_state["lab"] = {
             "case_base": case_base,
             "shap_scores": shap_scores,
@@ -603,7 +993,6 @@ def llm_lab_tab() -> None:
     if "pro" in model:
         st.info("Pro models can take several minutes and may be unreliable for interactive Streamlit runs. For quick experiments, use gpt-4.1-mini, gpt-5-mini, or gpt-5.4-mini.")
     prediction_goal = st.text_area("Prediction goal", key="lab_prediction_goal")
-    include_baseline = st.checkbox("Include baseline model signal in prompt", value=True)
     neighbors = st.number_input("Retrieved cases", 1, 12, 5, key="lab_neighbors")
 
     mode = st.radio("Run mode", ["Individual", "Batch"], horizontal=True)
@@ -617,7 +1006,7 @@ def llm_lab_tab() -> None:
                 try:
                     with st.spinner("Generating LLM prediction..."):
                         result = run_lab_prediction(
-                            row_index, lab, key, model, prediction_goal, include_baseline, int(neighbors)
+                            row_index, lab, key, model, prediction_goal, int(neighbors)
                         )
                     st.dataframe(pd.DataFrame([{k: v for k, v in result.items() if k not in {"prompt", "llm_raw_response"}}]))
                     st.text_area("Prompt", result["prompt"], height=320)
@@ -641,7 +1030,7 @@ def llm_lab_tab() -> None:
                     for i, row in enumerate(rows, start=1):
                         status.write(f"Processing row {row}. Completed {i - 1} of {len(rows)} predictions.")
                         results.append(
-                            run_lab_prediction(row, lab, key, model, prediction_goal, include_baseline, int(neighbors))
+                            run_lab_prediction(row, lab, key, model, prediction_goal, int(neighbors))
                         )
                         progress.progress(int(i / max(len(rows), 1) * 100))
                         status.write(f"Completed {i} of {len(rows)} predictions.")
