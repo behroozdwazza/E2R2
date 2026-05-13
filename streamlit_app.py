@@ -798,7 +798,7 @@ def main_pipeline_tab() -> None:
     df = uploaded_table(dataset_file)
     dictionary_df = uploaded_table(dictionary_file)
     data_dictionary = parse_data_dictionary(dictionary_df)
-    st.dataframe(df.head(10), use_container_width=True)
+    st.dataframe(df.head(10), width="stretch")
 
     columns = list(df.columns)
     target_column = st.selectbox("Outcome column", columns, index=len(columns) - 1)
@@ -866,11 +866,12 @@ def main_pipeline_tab() -> None:
     shap_table = results["shap_table"]
     st.subheader("Baseline Model")
     st.write(f"Selected model: **{training.best_run.name}**")
+    retrieval_label = getattr(training, "similarity_weighting", "equal-weight cosine retrieval")
     st.caption(
-        f"Retrieval uses {training.similarity_weighting}. All encoded predictor features receive equal "
+        f"Retrieval uses {retrieval_label}. All encoded predictor features receive equal "
         "weight when the cosine similarity score is calculated."
     )
-    st.dataframe(pd.DataFrame([training.best_run.metrics]), use_container_width=True)
+    st.dataframe(pd.DataFrame([training.best_run.metrics]), width="stretch")
 
     st.subheader("Downloads")
     downloads = [
@@ -1026,7 +1027,7 @@ def llm_lab_tab() -> None:
                         )
                     st.dataframe(
                         visible_prediction_results(pd.DataFrame([result])),
-                        use_container_width=True,
+                        width="stretch",
                     )
                     st.text_area("Prompt", result["prompt"], height=320)
                     st.text_area("Raw LLM response", result["llm_raw_response"], height=220)
@@ -1056,7 +1057,7 @@ def llm_lab_tab() -> None:
                     result_df = pd.DataFrame(results)
                     st.session_state["lab_batch"] = result_df
                     status.success(f"Batch complete: {len(result_df)} predictions generated.")
-                    st.dataframe(visible_prediction_results(result_df), use_container_width=True)
+                    st.dataframe(visible_prediction_results(result_df), width="stretch")
                 except Exception as exc:
                     st.error(str(exc))
         if "lab_batch" in st.session_state:
