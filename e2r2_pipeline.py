@@ -19,7 +19,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 
 RANDOM_STATE = 42
@@ -121,6 +121,11 @@ def split_feature_types(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return numeric_columns, categorical_columns
 
 
+def coerce_categorical_values(X: Any) -> pd.DataFrame:
+    frame = pd.DataFrame(X).copy()
+    return frame.apply(lambda col: col.map(lambda value: np.nan if pd.isna(value) else str(value)))
+
+
 def make_preprocessor(numeric_columns: Sequence[str], categorical_columns: Sequence[str]) -> ColumnTransformer:
     numeric_pipeline = Pipeline(
         steps=[
@@ -130,7 +135,15 @@ def make_preprocessor(numeric_columns: Sequence[str], categorical_columns: Seque
     )
     categorical_pipeline = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "stringify",
+                FunctionTransformer(
+                    coerce_categorical_values,
+                    validate=False,
+                    feature_names_out="one-to-one",
+                ),
+            ),
+            ("imputer", SimpleImputer(strategy="constant", fill_value="__missing__")),
             ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]
     )
