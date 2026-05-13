@@ -4,6 +4,7 @@ import cgi
 import html
 import io
 import json
+import re
 import threading
 import traceback
 import webbrowser
@@ -32,6 +33,7 @@ from e2r2_pipeline import (
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+RATIONALE_SIMPLIFIER_MODEL = "gpt-5-nano"
 
 OPENAI_LLM_MODELS = [
     ("gpt-5.4-mini", "GPT-5.4 mini - low cost, strong general reasoning"),
@@ -515,6 +517,7 @@ def training_section() -> str:
       <h2>Baseline Model</h2>
       {warning}
       <p><strong>Selected model:</strong> {esc(training.best_run.name)}</p>
+      <p class="muted">Retrieval uses {esc(training.similarity_weighting)}. All encoded predictor features receive equal weight when the cosine similarity score is calculated.</p>
       <div class="metrics">{metric_html}</div>
       <h3>Model Candidates</h3>
       <div class="data-wrap">{table_html(model_rows, max_rows=10)}</div>
@@ -553,6 +556,21 @@ def prediction_section() -> str:
             api_html = f"<h3>LLM Response</h3><pre>{esc(result['llm_response'])}</pre>"
         elif result.get("llm_error"):
             api_html = f"<div class='warn'>{esc(result['llm_error'])}</div>"
+        detail_html = ""
+        if result.get("detailed_rationale"):
+            detail_html = (
+                "<details><summary>Detailed rationale</summary>"
+                f"<p>{esc(result.get('detailed_rationale'))}</p>"
+                "</details>"
+            )
+        simplifier_note = ""
+        if result.get("simplified_with_model"):
+            simplifier_note = (
+                f"<p class='muted'>Displayed explanation simplified for general audiences with "
+                f"{esc(result.get('simplified_with_model'))}.</p>"
+            )
+        elif result.get("simplification_error"):
+            simplifier_note = f"<div class='warn'>{esc(result.get('simplification_error'))}</div>"
         result_html = f"""
         <h3>Prediction</h3>
         <div class="metrics">
@@ -561,6 +579,8 @@ def prediction_section() -> str:
         </div>
         <h3>Reasoning</h3>
         <p>{esc(result.get("rationale"))}</p>
+        {simplifier_note}
+        {detail_html}
         <h3>Retrieved Cases</h3>
         <div class="data-wrap">{table_html(result.get("retrieved"), max_rows=8)}</div>
         <h3>Alignment</h3>
@@ -636,10 +656,21 @@ def form_get(form: cgi.FieldStorage, key: str, default: Any = "") -> Any:
     return value.value
 
 
+def response_token_limit(model: str) -> int:
+    if "pro" in model:
+        return 6000
+    if model in {"gpt-5-mini", "gpt-5-nano"}:
+        return 3200
+    if model.startswith("gpt-5") or model.startswith("o"):
+        return 2400
+    return 1200
+
+
 def call_openai_responses(api_key: str, model: str, prompt: str) -> str:
     payload = {
         "model": model,
         "input": prompt,
+        "max_output_tokens": response_token_limit(model),
     }
     if not model.startswith("gpt-5") and not model.startswith("o"):
         payload["temperature"] = 0.2
@@ -662,6 +693,53 @@ def call_openai_responses(api_key: str, model: str, prompt: str) -> str:
             if content.get("type") in {"output_text", "text"}:
                 chunks.append(content.get("text", ""))
     return "\n".join(chunks).strip() or json.dumps(payload, indent=2)
+
+
+def parse_llm_json(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+
+def simplify_final_rationale(
+    api_key: str,
+    prediction_goal: str,
+    predicted_outcome: Any,
+    confidence_level: Any,
+    detailed_rationale: str,
+) -> str:
+    simplify_prompt = f"""You are rewriting a technical decision rationale for a general audience.
+
+Prediction goal:
+{prediction_goal or "Predict the outcome for this case."}
+
+Predicted outcome:
+{predicted_outcome}
+
+Confidence level:
+{confidence_level}
+
+Detailed rationale:
+{detailed_rationale}
+
+Rewrite this as one short, plain-language paragraph for a non-expert user.
+Requirements:
+- Keep the same conclusion and overall meaning.
+- Use everyday language.
+- Briefly explain the practical implications.
+- If the confidence is low or moderate, make the uncertainty understandable without sounding alarmist.
+- Do not mention SHAP, precedent retrieval, cosine similarity, Stage 1, Stage 2, baseline verification, or other technical framework terms.
+- Do not invent new facts, advice, or guarantees.
+- Return plain text only.
+"""
+    return call_openai_responses(api_key, RATIONALE_SIMPLIFIER_MODEL, simplify_prompt).strip()
 
 
 class E2R2Handler(BaseHTTPRequestHandler):
@@ -803,7 +881,7 @@ class E2R2Handler(BaseHTTPRequestHandler):
             data_dictionary=STATE.get("dictionary"),
             prediction_goal=STATE.get("prediction_goal", ""),
         )
-        predicted_outcome, confidence_level, rationale = local_e2r2_reasoning(
+        fallback_predicted_outcome, fallback_confidence_level, fallback_rationale = local_e2r2_reasoning(
             training,
             holdout_row,
             retrieved,
@@ -813,20 +891,58 @@ class E2R2Handler(BaseHTTPRequestHandler):
         model = form_get(form, "model", "gpt-4.1-mini")
         llm_response = ""
         llm_error = ""
+        simplification_error = ""
+        simplified_with_model = ""
+        detailed_rationale = ""
+        predicted_outcome = fallback_predicted_outcome
+        confidence_level = fallback_confidence_level
+        rationale = fallback_rationale
         if api_key:
             try:
                 llm_response = call_openai_responses(api_key, model, prompt)
+                parsed = parse_llm_json(llm_response)
+                llm_predicted_outcome = parsed.get("final_predicted_outcome", parsed.get("predicted_outcome", ""))
+                llm_confidence_level = parsed.get("final_confidence_level", parsed.get("confidence_level", ""))
+                detailed_rationale = parsed.get("final_rationale", parsed.get("rationale", ""))
+                if llm_predicted_outcome and llm_confidence_level and detailed_rationale:
+                    predicted_outcome = llm_predicted_outcome
+                    confidence_level = llm_confidence_level
+                    rationale = detailed_rationale
+                    try:
+                        simplified = simplify_final_rationale(
+                            api_key=api_key,
+                            prediction_goal=STATE.get("prediction_goal", ""),
+                            predicted_outcome=predicted_outcome,
+                            confidence_level=confidence_level,
+                            detailed_rationale=detailed_rationale,
+                        )
+                        if simplified:
+                            rationale = simplified
+                            simplified_with_model = RATIONALE_SIMPLIFIER_MODEL
+                    except Exception as exc:
+                        simplification_error = (
+                            f"The prediction was generated successfully, but the plain-language "
+                            f"rewrite step failed: {exc}"
+                        )
+                else:
+                    llm_error = (
+                        "The selected LLM returned a response, but the app could not extract the "
+                        "expected prediction fields. The local E2R2 result is shown instead."
+                    )
             except Exception as exc:
                 llm_error = f"The local E2R2 result was produced, but the LLM call failed: {exc}"
         STATE["prediction"] = {
             "predicted_outcome": predicted_outcome,
             "confidence_level": confidence_level,
             "rationale": rationale,
+            "detailed_rationale": detailed_rationale,
             "retrieved": retrieved,
             "alignment": alignment,
             "prompt": prompt,
             "llm_response": llm_response,
             "llm_error": llm_error,
+            "simplification_error": simplification_error,
+            "simplified_with_model": simplified_with_model,
         }
         self.redirect("/")
 

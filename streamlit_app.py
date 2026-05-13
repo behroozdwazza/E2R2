@@ -57,19 +57,23 @@ def visible_case_base(case_base: pd.DataFrame) -> pd.DataFrame:
     return case_base[[c for c in case_base.columns if not str(c).startswith("vector_")]]
 
 
+def response_token_limit(model: str) -> int:
+    if "pro" in model:
+        return 6000
+    if model in {"gpt-5-mini", "gpt-5-nano"}:
+        return 3200
+    if model.startswith("gpt-5") or model.startswith("o"):
+        return 2400
+    return 1200
+
+
 def call_openai(api_key: str, model: str, prompt: str) -> str:
     if not api_key:
         raise ValueError("No OpenAI API key was provided.")
-    if "pro" in model:
-        max_output_tokens = 4000
-    elif model.startswith("gpt-5") or model.startswith("o"):
-        max_output_tokens = 1800
-    else:
-        max_output_tokens = 900
     payload: Dict[str, Any] = {
         "model": model,
         "input": prompt,
-        "max_output_tokens": max_output_tokens,
+        "max_output_tokens": response_token_limit(model),
     }
     if not model.startswith("gpt-5") and not model.startswith("o"):
         payload["temperature"] = 0.2
