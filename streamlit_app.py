@@ -151,11 +151,69 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
-            return {}
+            return parse_labeled_response(text)
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
-            return {}
+            return parse_labeled_response(text)
+
+
+def parse_labeled_response(text: str) -> Dict[str, Any]:
+    alias_map = {
+        "predicted_outcome": "predicted_outcome",
+        "predicted outcome": "predicted_outcome",
+        "confidence_level": "confidence_level",
+        "confidence level": "confidence_level",
+        "rationale": "rationale",
+        "stage1_predicted_outcome": "stage1_predicted_outcome",
+        "stage1 predicted outcome": "stage1_predicted_outcome",
+        "stage1_confidence_level": "stage1_confidence_level",
+        "stage1 confidence level": "stage1_confidence_level",
+        "stage1_rationale": "stage1_rationale",
+        "stage1 rationale": "stage1_rationale",
+        "agreement": "agreement",
+        "baseline_p_positive": "baseline_p_positive",
+        "baseline p positive": "baseline_p_positive",
+        "verification_rule_applied": "verification_rule_applied",
+        "verification rule applied": "verification_rule_applied",
+        "final_predicted_outcome": "final_predicted_outcome",
+        "final predicted outcome": "final_predicted_outcome",
+        "final_confidence_level": "final_confidence_level",
+        "final confidence level": "final_confidence_level",
+        "final_rationale": "final_rationale",
+        "final rationale": "final_rationale",
+    }
+    parsed: Dict[str, Any] = {}
+    current_key: Optional[str] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current_key and current_key in parsed:
+                parsed[current_key] = f"{parsed[current_key]}\n".rstrip()
+            continue
+        line = re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", line)
+        line = line.replace("**", "").strip()
+        match = re.match(r"^([A-Za-z0-9_ ]+?)\s*:\s*(.*)$", line)
+        if match:
+            raw_key = match.group(1).strip().lower()
+            key = alias_map.get(raw_key)
+            if key:
+                current_key = key
+                parsed[key] = match.group(2).strip()
+                continue
+        if current_key:
+            previous = str(parsed.get(current_key, "")).rstrip()
+            parsed[current_key] = f"{previous} {line}".strip() if previous else line
+    if "agreement" in parsed:
+        value = str(parsed["agreement"]).strip().lower()
+        if value in {"true", "false"}:
+            parsed["agreement"] = value == "true"
+    if "baseline_p_positive" in parsed:
+        try:
+            parsed["baseline_p_positive"] = float(str(parsed["baseline_p_positive"]).strip())
+        except ValueError:
+            pass
+    return parsed
 
 
 def simplify_final_rationale(
