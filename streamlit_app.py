@@ -57,6 +57,18 @@ def visible_case_base(case_base: pd.DataFrame) -> pd.DataFrame:
     return case_base[[c for c in case_base.columns if not str(c).startswith("vector_")]]
 
 
+def visible_prediction_results(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "row_index",
+        "actual_outcome",
+        "llm_predicted_outcome",
+        "llm_confidence_level",
+        "llm_rationale",
+    ]
+    available = [column for column in columns if column in df.columns]
+    return df[available].copy() if available else df.copy()
+
+
 def response_token_limit(model: str) -> int:
     if "pro" in model:
         return 6000
@@ -1012,7 +1024,10 @@ def llm_lab_tab() -> None:
                         result = run_lab_prediction(
                             row_index, lab, key, model, prediction_goal, int(neighbors)
                         )
-                    st.dataframe(pd.DataFrame([{k: v for k, v in result.items() if k not in {"prompt", "llm_raw_response"}}]))
+                    st.dataframe(
+                        visible_prediction_results(pd.DataFrame([result])),
+                        use_container_width=True,
+                    )
                     st.text_area("Prompt", result["prompt"], height=320)
                     st.text_area("Raw LLM response", result["llm_raw_response"], height=220)
                 except Exception as exc:
@@ -1041,7 +1056,7 @@ def llm_lab_tab() -> None:
                     result_df = pd.DataFrame(results)
                     st.session_state["lab_batch"] = result_df
                     status.success(f"Batch complete: {len(result_df)} predictions generated.")
-                    st.dataframe(result_df.drop(columns=["prompt", "llm_raw_response"], errors="ignore"), use_container_width=True)
+                    st.dataframe(visible_prediction_results(result_df), use_container_width=True)
                 except Exception as exc:
                     st.error(str(exc))
         if "lab_batch" in st.session_state:
