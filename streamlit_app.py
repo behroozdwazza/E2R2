@@ -11,6 +11,7 @@ import requests
 import streamlit as st
 
 from e2r2_pipeline import (
+    apply_baseline_verification,
     build_case_base,
     build_e2r2_prompt,
     case_vectors_dataset,
@@ -925,6 +926,13 @@ def run_lab_prediction(
     )
     raw = call_openai(api_key, model, prompt)
     parsed = parse_json_response(raw)
+    positive_label, _ = positive_class_specification(holdout, lab["target_column"], prediction_goal)
+    parsed = apply_baseline_verification(
+        parsed,
+        baseline_predicted_outcome=row.get("baseline_predicted_outcome", ""),
+        baseline_confidence=row.get("baseline_confidence", ""),
+        positive_class_label=positive_label,
+    )
     final_predicted, final_confidence, final_rationale = extracted_prediction_fields(parsed)
     return {
         "row_index": row_index,
@@ -1083,6 +1091,18 @@ def main_pipeline_tab() -> None:
                 with st.spinner("Generating LLM response..."):
                     response_text = call_openai(key, model, prompt)
                 parsed = parse_json_response(response_text)
+                baseline_positive_probability = float(
+                    training.best_run.pipeline.predict_proba(pd.DataFrame([holdout_row]))[0, 1]
+                )
+                baseline_predicted_outcome = (
+                    training.positive_label if baseline_positive_probability >= 0.5 else training.negative_label
+                )
+                parsed = apply_baseline_verification(
+                    parsed,
+                    baseline_predicted_outcome=baseline_predicted_outcome,
+                    baseline_confidence=max(baseline_positive_probability, 1 - baseline_positive_probability),
+                    positive_class_label=training.positive_label,
+                )
                 final_predicted, final_confidence, detailed_rationale = extracted_prediction_fields(parsed)
                 if final_predicted and final_confidence and detailed_rationale:
                     simplified_rationale = detailed_rationale

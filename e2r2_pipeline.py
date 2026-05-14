@@ -213,6 +213,131 @@ def compute_metrics(y_true: pd.Series, proba: np.ndarray, threshold: float = 0.5
     return metrics
 
 
+def normalize_label_for_verification(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().strip('"').strip("'").strip()
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+        return str(number)
+    except ValueError:
+        return text.lower()
+
+
+def capped_stage1_confidence(confidence: Any) -> str:
+    value = str(confidence or "").strip().lower()
+    if value == "high":
+        return "moderate"
+    if value in {"low", "moderate"}:
+        return value
+    return "moderate"
+
+
+def baseline_verification_note(rule: str, baseline_confidence: float) -> str:
+    confidence = f"{baseline_confidence:.4f}"
+    if rule == "A":
+        return f"The baseline model agreed with this prediction at confidence {confidence}."
+    if rule == "B":
+        return (
+            f"The baseline model disagreed at confident strength ({confidence}), so the "
+            "verification step adopted the baseline verdict."
+        )
+    if rule == "C":
+        return (
+            f"The baseline model disagreed at low confidence ({confidence}) and was not "
+            "strong enough to override the precedent-based verdict."
+        )
+    return (
+        f"The baseline model disagreed at borderline confidence ({confidence}), which was "
+        "not sufficient to override but reduced confidence in the final verdict."
+    )
+
+
+def apply_baseline_verification(
+    parsed: Dict[str, Any],
+    baseline_predicted_outcome: Any,
+    baseline_confidence: Any,
+    positive_class_label: Any,
+) -> Dict[str, Any]:
+    """Recompute two-stage verification fields deterministically after the LLM returns Stage 1."""
+    corrected = dict(parsed or {})
+    stage1_verdict = (
+        corrected.get("stage1_predicted_outcome")
+        or corrected.get("final_predicted_outcome")
+        or corrected.get("predicted_outcome")
+        or ""
+    )
+    stage1_confidence = (
+        corrected.get("stage1_confidence_level")
+        or corrected.get("final_confidence_level")
+        or corrected.get("confidence_level")
+        or "moderate"
+    )
+    stage1_rationale = (
+        corrected.get("stage1_rationale")
+        or corrected.get("final_rationale")
+        or corrected.get("rationale")
+        or ""
+    )
+    try:
+        confidence_value = float(baseline_confidence)
+    except (TypeError, ValueError):
+        confidence_value = 0.5
+    confidence_value = min(1.0, max(0.0, confidence_value))
+
+    agreement = normalize_label_for_verification(stage1_verdict) == normalize_label_for_verification(
+        baseline_predicted_outcome
+    )
+    baseline_is_positive = normalize_label_for_verification(baseline_predicted_outcome) == normalize_label_for_verification(
+        positive_class_label
+    )
+    baseline_p_positive = confidence_value if baseline_is_positive else 1 - confidence_value
+
+    if agreement:
+        rule = "A"
+        final_verdict = stage1_verdict
+        final_confidence = str(stage1_confidence or "moderate").strip().lower() or "moderate"
+    elif confidence_value >= 0.70:
+        rule = "B"
+        final_verdict = baseline_predicted_outcome
+        final_confidence = "moderate"
+    elif confidence_value < 0.60:
+        rule = "C"
+        final_verdict = stage1_verdict
+        final_confidence = capped_stage1_confidence(stage1_confidence)
+    else:
+        rule = "D"
+        final_verdict = stage1_verdict
+        final_confidence = "low"
+
+    note = baseline_verification_note(rule, confidence_value)
+    final_rationale = str(stage1_rationale or corrected.get("final_rationale") or corrected.get("rationale") or "").strip()
+    if note not in final_rationale:
+        final_rationale = f"{final_rationale} {note}".strip()
+
+    corrected.update(
+        {
+            "stage1_predicted_outcome": stage1_verdict,
+            "stage1_confidence_level": stage1_confidence,
+            "stage1_rationale": stage1_rationale,
+            "agreement": agreement,
+            "baseline_p_positive": round(float(baseline_p_positive), 4),
+            "verification_rule_applied": rule,
+            "final_predicted_outcome": final_verdict,
+            "final_confidence_level": final_confidence,
+            "final_rationale": final_rationale,
+        }
+    )
+    return corrected
+
+
 def train_e2r2_baseline(
     df: pd.DataFrame,
     target_column: str,
