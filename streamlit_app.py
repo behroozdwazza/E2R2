@@ -808,7 +808,7 @@ Step 3 — Apply the verification rules in order. Stop at the first rule that fi
 
 Rule A — Agreement. If agreement is TRUE (as determined in Step 1), keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider baseline_confidence in this rule — agreement alone fires Rule A regardless of how confident or unconfident the baseline is.
 
-Rule B — Dataset-calibrated baseline override. If agreement is FALSE and baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_confidence is greater than the average baseline confidence among true positive cases in the holdout set minus 0.10. If agreement is FALSE and baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_confidence is greater than the average baseline confidence among true negative cases in the holdout set. final_confidence = moderate under override because two independent signals disagreed.
+Rule B — Dataset-calibrated baseline override. If agreement is FALSE and baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_confidence is greater than the average baseline confidence among true positive cases in the holdout set multiplied by 0.8. If agreement is FALSE and baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_confidence is greater than the average baseline confidence among true negative cases in the holdout set multiplied by 0.9. final_confidence = moderate under override because two independent signals disagreed.
 
 Rule C — Dataset-calibrated keep Stage 1. If agreement is FALSE and baseline_confidence does not exceed the relevant true-positive or true-negative threshold, keep the Stage 1 verdict. Cap final_confidence at moderate: downgrade high to moderate, and leave moderate or low unchanged.
 
@@ -842,8 +842,8 @@ Baseline model output:
 - baseline_confidence: {float(baseline_confidence):.4f}
 
 Dataset-calibrated baseline override thresholds:
-- positive_override_threshold_true_positive_mean_minus_0_10: {positive_override_threshold:.4f}
-- negative_override_threshold_true_negative_mean: {negative_override_threshold:.4f}
+- positive_override_threshold_true_positive_mean_x_0_8: {positive_override_threshold:.4f}
+- negative_override_threshold_true_negative_mean_x_0_9: {negative_override_threshold:.4f}
 
 =================================================================
 OUTPUT
