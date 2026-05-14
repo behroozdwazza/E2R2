@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -137,8 +138,8 @@ def secret_api_key() -> str:
         if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
             return str(st.secrets["openai"]["api_key"])
     except Exception:
-        return ""
-    return ""
+        pass
+    return os.environ.get("OPENAI_API_KEY", "")
 
 
 def resolved_api_key(input_key: str) -> str:
@@ -147,41 +148,131 @@ def resolved_api_key(input_key: str) -> str:
 
 def parse_json_response(text: str) -> Dict[str, Any]:
     try:
-        return json.loads(text)
+        return normalize_llm_fields(json.loads(text))
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             return parse_labeled_response(text)
         try:
-            return json.loads(match.group(0))
+            return normalize_llm_fields(json.loads(match.group(0)))
         except json.JSONDecodeError:
             return parse_labeled_response(text)
+
+
+def normalized_field_name(key: Any) -> str:
+    text = str(key).strip().lower()
+    text = text.replace("**", "").replace("`", "")
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def clean_llm_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        cleaned = value.strip().rstrip(",")
+        cleaned = cleaned.strip().strip('"').strip("'").strip()
+        return cleaned
+    return value
+
+
+def normalize_llm_fields(value: Any, prefix: str = "") -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    alias_map = {
+        "predicted_outcome": "predicted_outcome",
+        "prediction": "predicted_outcome",
+        "predicted_class": "predicted_outcome",
+        "outcome": "predicted_outcome",
+        "verdict": "predicted_outcome",
+        "class_label": "predicted_outcome",
+        "final_predicted_outcome": "final_predicted_outcome",
+        "final_prediction": "final_predicted_outcome",
+        "final_predicted_class": "final_predicted_outcome",
+        "final_outcome": "final_predicted_outcome",
+        "final_verdict": "final_predicted_outcome",
+        "llm_predicted_outcome": "final_predicted_outcome",
+        "confidence_level": "confidence_level",
+        "confidence": "confidence_level",
+        "predicted_confidence": "confidence_level",
+        "final_confidence_level": "final_confidence_level",
+        "final_confidence": "final_confidence_level",
+        "llm_confidence_level": "final_confidence_level",
+        "rationale": "rationale",
+        "reasoning": "rationale",
+        "explanation": "rationale",
+        "final_rationale": "final_rationale",
+        "final_reasoning": "final_rationale",
+        "final_explanation": "final_rationale",
+        "llm_rationale": "final_rationale",
+        "stage1_predicted_outcome": "stage1_predicted_outcome",
+        "stage1_verdict": "stage1_predicted_outcome",
+        "stage1_confidence_level": "stage1_confidence_level",
+        "stage1_confidence": "stage1_confidence_level",
+        "stage1_rationale": "stage1_rationale",
+        "stage1_reasoning": "stage1_rationale",
+        "agreement": "agreement",
+        "baseline_p_positive": "baseline_p_positive",
+        "verification_rule_applied": "verification_rule_applied",
+        "verification_rule": "verification_rule_applied",
+    }
+    parsed: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = normalized_field_name(raw_key)
+        full_key = f"{prefix}_{key}" if prefix else key
+        target = alias_map.get(full_key, alias_map.get(key))
+        if target and not isinstance(raw_value, (dict, list)):
+            parsed[target] = clean_llm_scalar(raw_value)
+        if isinstance(raw_value, dict):
+            nested = normalize_llm_fields(raw_value, key)
+            for nested_key, nested_value in nested.items():
+                parsed.setdefault(nested_key, nested_value)
+            nested_without_prefix = normalize_llm_fields(raw_value)
+            for nested_key, nested_value in nested_without_prefix.items():
+                parsed.setdefault(nested_key, nested_value)
+    return parsed
 
 
 def parse_labeled_response(text: str) -> Dict[str, Any]:
     alias_map = {
         "predicted_outcome": "predicted_outcome",
         "predicted outcome": "predicted_outcome",
+        "prediction": "predicted_outcome",
+        "predicted class": "predicted_outcome",
+        "outcome": "predicted_outcome",
+        "verdict": "predicted_outcome",
         "confidence_level": "confidence_level",
         "confidence level": "confidence_level",
+        "confidence": "confidence_level",
         "rationale": "rationale",
+        "reasoning": "rationale",
+        "explanation": "rationale",
         "stage1_predicted_outcome": "stage1_predicted_outcome",
         "stage1 predicted outcome": "stage1_predicted_outcome",
+        "stage1 verdict": "stage1_predicted_outcome",
         "stage1_confidence_level": "stage1_confidence_level",
         "stage1 confidence level": "stage1_confidence_level",
+        "stage1 confidence": "stage1_confidence_level",
         "stage1_rationale": "stage1_rationale",
         "stage1 rationale": "stage1_rationale",
+        "stage1 reasoning": "stage1_rationale",
         "agreement": "agreement",
         "baseline_p_positive": "baseline_p_positive",
         "baseline p positive": "baseline_p_positive",
         "verification_rule_applied": "verification_rule_applied",
         "verification rule applied": "verification_rule_applied",
+        "verification rule": "verification_rule_applied",
         "final_predicted_outcome": "final_predicted_outcome",
         "final predicted outcome": "final_predicted_outcome",
+        "final prediction": "final_predicted_outcome",
+        "final predicted class": "final_predicted_outcome",
+        "final outcome": "final_predicted_outcome",
+        "final verdict": "final_predicted_outcome",
         "final_confidence_level": "final_confidence_level",
         "final confidence level": "final_confidence_level",
+        "final confidence": "final_confidence_level",
         "final_rationale": "final_rationale",
         "final rationale": "final_rationale",
+        "final reasoning": "final_rationale",
+        "final explanation": "final_rationale",
     }
     parsed: Dict[str, Any] = {}
     current_key: Optional[str] = None
@@ -193,13 +284,13 @@ def parse_labeled_response(text: str) -> Dict[str, Any]:
             continue
         line = re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", line)
         line = line.replace("**", "").strip()
-        match = re.match(r"^([A-Za-z0-9_ ]+?)\s*:\s*(.*)$", line)
+        match = re.match(r'^["\']?([A-Za-z0-9_ \-]+?)["\']?\s*[:=-]\s*(.*)$', line)
         if match:
-            raw_key = match.group(1).strip().lower()
+            raw_key = match.group(1).strip().lower().replace("-", " ")
             key = alias_map.get(raw_key)
             if key:
                 current_key = key
-                parsed[key] = match.group(2).strip()
+                parsed[key] = clean_llm_scalar(match.group(2))
                 continue
         if current_key:
             previous = str(parsed.get(current_key, "")).rstrip()
@@ -214,6 +305,28 @@ def parse_labeled_response(text: str) -> Dict[str, Any]:
         except ValueError:
             pass
     return parsed
+
+
+def extracted_prediction_fields(parsed: Dict[str, Any]) -> Tuple[Any, Any, str]:
+    predicted = (
+        parsed.get("final_predicted_outcome")
+        or parsed.get("predicted_outcome")
+        or parsed.get("stage1_predicted_outcome")
+        or ""
+    )
+    confidence = (
+        parsed.get("final_confidence_level")
+        or parsed.get("confidence_level")
+        or parsed.get("stage1_confidence_level")
+        or ""
+    )
+    rationale = (
+        parsed.get("final_rationale")
+        or parsed.get("rationale")
+        or parsed.get("stage1_rationale")
+        or ""
+    )
+    return clean_llm_scalar(predicted), clean_llm_scalar(confidence), str(clean_llm_scalar(rationale) or "")
 
 
 def simplify_final_rationale(
@@ -812,9 +925,7 @@ def run_lab_prediction(
     )
     raw = call_openai(api_key, model, prompt)
     parsed = parse_json_response(raw)
-    final_predicted = parsed.get("final_predicted_outcome", parsed.get("predicted_outcome", ""))
-    final_confidence = parsed.get("final_confidence_level", parsed.get("confidence_level", ""))
-    final_rationale = parsed.get("final_rationale", parsed.get("rationale", ""))
+    final_predicted, final_confidence, final_rationale = extracted_prediction_fields(parsed)
     return {
         "row_index": row_index,
         "actual_outcome": row.get(lab["target_column"], ""),
@@ -972,9 +1083,7 @@ def main_pipeline_tab() -> None:
                 with st.spinner("Generating LLM response..."):
                     response_text = call_openai(key, model, prompt)
                 parsed = parse_json_response(response_text)
-                final_predicted = parsed.get("final_predicted_outcome", parsed.get("predicted_outcome", ""))
-                final_confidence = parsed.get("final_confidence_level", parsed.get("confidence_level", ""))
-                detailed_rationale = parsed.get("final_rationale", parsed.get("rationale", ""))
+                final_predicted, final_confidence, detailed_rationale = extracted_prediction_fields(parsed)
                 if final_predicted and final_confidence and detailed_rationale:
                     simplified_rationale = detailed_rationale
                     simplify_note = ""
