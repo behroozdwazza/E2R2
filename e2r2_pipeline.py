@@ -277,6 +277,7 @@ def baseline_verification_thresholds_from_holdout(
     target_column: str,
     positive_class_label: Any,
     default_threshold: float = 0.70,
+    positive_sensitivity_margin: float = 0.10,
 ) -> Dict[str, float]:
     if holdout is None or holdout.empty or target_column not in holdout.columns:
         return {
@@ -308,9 +309,13 @@ def baseline_verification_thresholds_from_holdout(
         positive_threshold = fallback
     if np.isnan(negative_threshold):
         negative_threshold = fallback
+    adjusted_positive_threshold = positive_threshold - positive_sensitivity_margin
     return {
-        "positive_override_threshold": min(1.0, max(0.0, positive_threshold)),
+        "positive_override_threshold": min(1.0, max(0.0, adjusted_positive_threshold)),
         "negative_override_threshold": min(1.0, max(0.0, negative_threshold)),
+        "positive_override_threshold_raw": min(1.0, max(0.0, positive_threshold)),
+        "negative_override_threshold_raw": min(1.0, max(0.0, negative_threshold)),
+        "positive_sensitivity_margin": positive_sensitivity_margin,
     }
 
 
@@ -331,6 +336,7 @@ def apply_baseline_verification(
     positive_class_label: Any,
     positive_override_threshold: Optional[float] = None,
     negative_override_threshold: Optional[float] = None,
+    **_: Any,
 ) -> Dict[str, Any]:
     """Recompute two-stage verification fields deterministically after the LLM returns Stage 1."""
     corrected = dict(parsed or {})
@@ -1164,7 +1170,7 @@ Step 2 — Compute baseline_p_positive (for output transparency only; do NOT use
 Step 3 — Apply the verification rules in order. Stop at the first rule that fires.
 
 Rule A — Agreement. If agreement is TRUE (as determined in Step 1), keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider baseline_confidence in this rule — agreement alone fires Rule A regardless of how confident or unconfident the baseline is.
-Rule B — Dataset-calibrated baseline override. If agreement is FALSE and baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_confidence is greater than the average baseline confidence among true positive cases in the holdout set. If agreement is FALSE and baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_confidence is greater than the average baseline confidence among true negative cases in the holdout set. final_confidence = moderate under override because two independent signals disagreed.
+Rule B — Dataset-calibrated baseline override. If agreement is FALSE and baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_confidence is greater than the average baseline confidence among true positive cases in the holdout set minus 0.10. If agreement is FALSE and baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_confidence is greater than the average baseline confidence among true negative cases in the holdout set. final_confidence = moderate under override because two independent signals disagreed.
 Rule C — Dataset-calibrated keep Stage 1. If agreement is FALSE and baseline_confidence does not exceed the relevant true-positive or true-negative threshold, keep the Stage 1 verdict. Cap final_confidence at moderate: downgrade high to moderate, and leave moderate or low unchanged.
 
 Do not invoke any rule other than the three above. Do not override based on the Stage 1 rationale text or the Stage 1 confidence — only the agreement check, baseline_predicted_outcome, baseline_confidence, and the dataset-calibrated threshold for the baseline's predicted class drive the verification.
@@ -1202,7 +1208,7 @@ Baseline model output:
 - baseline_confidence: {baseline_confidence:.4f}
 
 Dataset-calibrated baseline override thresholds:
-- positive_override_threshold_true_positive_mean: {positive_override_threshold:.4f}
+- positive_override_threshold_true_positive_mean_minus_0_10: {positive_override_threshold:.4f}
 - negative_override_threshold_true_negative_mean: {negative_override_threshold:.4f}
 
 =================================================================
