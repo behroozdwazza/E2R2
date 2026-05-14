@@ -75,6 +75,40 @@ def visible_prediction_results(df: pd.DataFrame) -> pd.DataFrame:
     return df[available].copy() if available else df.copy()
 
 
+def baseline_model_comparison(training: Any) -> pd.DataFrame:
+    rows = []
+    for run in getattr(training, "all_runs", []) or []:
+        row = {
+            "selected": "Yes" if run.name == training.best_run.name else "",
+            "model": run.name,
+            "selection_score": run.score,
+        }
+        row.update(run.metrics)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame([{"selected": "Yes", "model": training.best_run.name, **training.best_run.metrics}])
+
+    table = pd.DataFrame(rows)
+    preferred_order = [
+        "selected",
+        "model",
+        "selection_score",
+        "auc",
+        "balanced_accuracy",
+        "accuracy",
+        "recall",
+        "specificity",
+        "precision",
+        "f1",
+    ]
+    ordered = [column for column in preferred_order if column in table.columns]
+    ordered.extend([column for column in table.columns if column not in ordered])
+    table = table[ordered].sort_values("selection_score", ascending=False, na_position="last")
+    numeric_columns = table.select_dtypes(include=["number"]).columns
+    table[numeric_columns] = table[numeric_columns].round(4)
+    return table.reset_index(drop=True)
+
+
 def response_token_limit(model: str) -> int:
     if "pro" in model:
         return 6000
@@ -1053,14 +1087,14 @@ def main_pipeline_tab() -> None:
     training = results["training"]
     case_base = results["case_base"]
     shap_table = results["shap_table"]
-    st.subheader("Baseline Model")
+    st.subheader("Baseline Models")
     st.write(f"Selected model: **{training.best_run.name}**")
     retrieval_label = getattr(training, "similarity_weighting", "equal-weight cosine retrieval")
     st.caption(
         f"Retrieval uses {retrieval_label}. All encoded predictor features receive equal "
         "weight when the cosine similarity score is calculated."
     )
-    st.dataframe(pd.DataFrame([training.best_run.metrics]), width="stretch")
+    st.dataframe(baseline_model_comparison(training), width="stretch")
 
     st.subheader("Downloads")
     downloads = [
