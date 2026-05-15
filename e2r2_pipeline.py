@@ -255,21 +255,45 @@ def first_present_value(*values: Any, default: Any = "") -> Any:
     return default
 
 
-def baseline_verification_note(rule: str, baseline_confidence: float) -> str:
-    confidence = f"{baseline_confidence:.4f}"
+def baseline_verification_note(rule: str, baseline_positive_probability: float, threshold: Optional[float] = None) -> str:
+    probability = f"{baseline_positive_probability:.4f}"
+    threshold_text = f" against threshold {threshold:.4f}" if threshold is not None else ""
     if rule == "A":
-        return f"The baseline model agreed with this prediction at confidence {confidence}."
+        return f"The baseline model agreed with this prediction; baseline_positive_probability was {probability}."
     if rule == "B":
         return (
-            f"The baseline model disagreed, but its confidence ({confidence}) exceeded the "
-            "dataset-calibrated override threshold for its predicted class, so the verification "
-            "step adopted the baseline verdict."
+            f"The baseline model disagreed, but baseline_positive_probability ({probability}) crossed "
+            f"the dataset-calibrated override threshold{threshold_text}, so the verification step "
+            "adopted the baseline verdict."
         )
     return (
-        f"The baseline model disagreed at confidence {confidence}, but this did not exceed the "
-        "dataset-calibrated override threshold for its predicted class, so the verification step "
+        f"The baseline model disagreed, but baseline_positive_probability ({probability}) did not cross "
+        f"the relevant dataset-calibrated override threshold{threshold_text}, so the verification step "
         "kept the precedent-based verdict."
     )
+
+
+def baseline_positive_probability_from_row(
+    baseline_predicted_outcome: Any,
+    baseline_confidence: Any,
+    positive_class_label: Any,
+    baseline_positive_probability: Any = None,
+) -> float:
+    try:
+        probability = float(baseline_positive_probability)
+        if not np.isnan(probability):
+            return min(1.0, max(0.0, probability))
+    except (TypeError, ValueError):
+        pass
+    try:
+        confidence = float(baseline_confidence)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = min(1.0, max(0.0, confidence))
+    baseline_is_positive = normalize_label_for_verification(baseline_predicted_outcome) == normalize_label_for_verification(
+        positive_class_label
+    )
+    return confidence if baseline_is_positive else 1 - confidence
 
 
 def baseline_verification_thresholds_from_holdout(
@@ -277,48 +301,65 @@ def baseline_verification_thresholds_from_holdout(
     target_column: str,
     positive_class_label: Any,
     default_threshold: float = 0.70,
-    positive_threshold_multiplier: float = 0.80,
-    negative_threshold_multiplier: float = 0.90,
 ) -> Dict[str, float]:
     if holdout is None or holdout.empty or target_column not in holdout.columns:
         return {
             "positive_override_threshold": default_threshold,
-            "negative_override_threshold": default_threshold,
+            "negative_override_threshold": 1 - default_threshold,
         }
-    required = {"baseline_predicted_outcome", "baseline_confidence"}
+    required = {"baseline_predicted_outcome"}
     if not required.issubset(set(holdout.columns)):
         return {
             "positive_override_threshold": default_threshold,
-            "negative_override_threshold": default_threshold,
+            "negative_override_threshold": 1 - default_threshold,
         }
 
-    frame = holdout[[target_column, "baseline_predicted_outcome", "baseline_confidence"]].copy()
-    frame["baseline_confidence"] = pd.to_numeric(frame["baseline_confidence"], errors="coerce")
-    frame = frame.dropna(subset=["baseline_confidence"])
+    columns = [target_column, "baseline_predicted_outcome"]
+    if "baseline_positive_probability" in holdout.columns:
+        columns.append("baseline_positive_probability")
+    if "baseline_confidence" in holdout.columns:
+        columns.append("baseline_confidence")
+    frame = holdout[columns].copy()
     positive_norm = normalize_label_for_verification(positive_class_label)
     actual_positive = frame[target_column].map(normalize_label_for_verification) == positive_norm
     predicted_positive = frame["baseline_predicted_outcome"].map(normalize_label_for_verification) == positive_norm
+    frame["baseline_positive_probability"] = [
+        baseline_positive_probability_from_row(
+            predicted,
+            confidence,
+            positive_class_label,
+            probability,
+        )
+        for predicted, confidence, probability in zip(
+            frame["baseline_predicted_outcome"],
+            frame["baseline_confidence"] if "baseline_confidence" in frame.columns else [None] * len(frame),
+            frame["baseline_positive_probability"] if "baseline_positive_probability" in frame.columns else [None] * len(frame),
+        )
+    ]
+    frame["baseline_positive_probability"] = pd.to_numeric(
+        frame["baseline_positive_probability"], errors="coerce"
+    )
+    frame = frame.dropna(subset=["baseline_positive_probability"])
 
-    true_positive_conf = frame.loc[actual_positive & predicted_positive, "baseline_confidence"]
-    true_negative_conf = frame.loc[~actual_positive & ~predicted_positive, "baseline_confidence"]
-    correct_conf = frame.loc[actual_positive == predicted_positive, "baseline_confidence"]
+    true_positive_prob = frame.loc[actual_positive & predicted_positive, "baseline_positive_probability"]
+    true_negative_prob = frame.loc[~actual_positive & ~predicted_positive, "baseline_positive_probability"]
+    correct_prob = frame.loc[actual_positive == predicted_positive, "baseline_positive_probability"]
 
-    positive_threshold = float(true_positive_conf.mean()) if not true_positive_conf.empty else np.nan
-    negative_threshold = float(true_negative_conf.mean()) if not true_negative_conf.empty else np.nan
-    fallback = float(correct_conf.mean()) if not correct_conf.empty else default_threshold
+    positive_threshold = float(true_negative_prob.quantile(0.80)) if not true_negative_prob.empty else np.nan
+    negative_threshold = float(true_positive_prob.quantile(0.10)) if not true_positive_prob.empty else np.nan
+    fallback_positive = float(correct_prob.quantile(0.80)) if not correct_prob.empty else default_threshold
+    fallback_negative = float(correct_prob.quantile(0.10)) if not correct_prob.empty else 1 - default_threshold
     if np.isnan(positive_threshold):
-        positive_threshold = fallback
+        positive_threshold = fallback_positive
     if np.isnan(negative_threshold):
-        negative_threshold = fallback
-    adjusted_positive_threshold = positive_threshold * positive_threshold_multiplier
-    adjusted_negative_threshold = negative_threshold * negative_threshold_multiplier
+        negative_threshold = fallback_negative
     return {
-        "positive_override_threshold": min(1.0, max(0.0, adjusted_positive_threshold)),
-        "negative_override_threshold": min(1.0, max(0.0, adjusted_negative_threshold)),
+        "positive_override_threshold": min(1.0, max(0.0, positive_threshold)),
+        "negative_override_threshold": min(1.0, max(0.0, negative_threshold)),
         "positive_override_threshold_raw": min(1.0, max(0.0, positive_threshold)),
         "negative_override_threshold_raw": min(1.0, max(0.0, negative_threshold)),
-        "positive_threshold_multiplier": positive_threshold_multiplier,
-        "negative_threshold_multiplier": negative_threshold_multiplier,
+        "positive_threshold_percentile": 0.80,
+        "negative_threshold_percentile": 0.10,
     }
 
 
@@ -329,6 +370,7 @@ def baseline_verification_thresholds_from_training(training: "TrainingResult") -
         {1: training.positive_label, 0: training.negative_label}
     )
     frame["baseline_confidence"] = frame["confidence"]
+    frame["baseline_positive_probability"] = frame["positive_probability"]
     return baseline_verification_thresholds_from_holdout(frame, training.target_column, training.positive_label)
 
 
@@ -337,6 +379,7 @@ def apply_baseline_verification(
     baseline_predicted_outcome: Any,
     baseline_confidence: Any,
     positive_class_label: Any,
+    baseline_positive_probability: Any = None,
     positive_override_threshold: Optional[float] = None,
     negative_override_threshold: Optional[float] = None,
     **_: Any,
@@ -359,11 +402,12 @@ def apply_baseline_verification(
         corrected.get("final_rationale"),
         corrected.get("rationale"),
     )
-    try:
-        confidence_value = float(baseline_confidence)
-    except (TypeError, ValueError):
-        confidence_value = 0.5
-    confidence_value = min(1.0, max(0.0, confidence_value))
+    baseline_p_positive = baseline_positive_probability_from_row(
+        baseline_predicted_outcome,
+        baseline_confidence,
+        positive_class_label,
+        baseline_positive_probability,
+    )
 
     agreement = normalize_label_for_verification(stage1_verdict) == normalize_label_for_verification(
         baseline_predicted_outcome
@@ -371,7 +415,6 @@ def apply_baseline_verification(
     baseline_is_positive = normalize_label_for_verification(baseline_predicted_outcome) == normalize_label_for_verification(
         positive_class_label
     )
-    baseline_p_positive = confidence_value if baseline_is_positive else 1 - confidence_value
     override_threshold = (
         positive_override_threshold if baseline_is_positive else negative_override_threshold
     )
@@ -387,7 +430,9 @@ def apply_baseline_verification(
         rule = "A"
         final_verdict = stage1_verdict
         final_confidence = str(stage1_confidence or "moderate").strip().lower() or "moderate"
-    elif confidence_value > override_threshold:
+    elif (baseline_is_positive and baseline_p_positive > override_threshold) or (
+        not baseline_is_positive and baseline_p_positive < override_threshold
+    ):
         rule = "B"
         final_verdict = baseline_predicted_outcome
         final_confidence = "moderate"
@@ -396,7 +441,7 @@ def apply_baseline_verification(
         final_verdict = stage1_verdict
         final_confidence = capped_stage1_confidence(stage1_confidence)
 
-    note = baseline_verification_note(rule, confidence_value)
+    note = baseline_verification_note(rule, baseline_p_positive, override_threshold if not agreement else None)
     final_rationale = str(
         first_present_value(stage1_rationale, corrected.get("final_rationale"), corrected.get("rationale"))
     ).strip()
@@ -410,6 +455,7 @@ def apply_baseline_verification(
             "stage1_rationale": stage1_rationale,
             "agreement": agreement,
             "baseline_p_positive": round(float(baseline_p_positive), 4),
+            "baseline_positive_probability": round(float(baseline_p_positive), 4),
             "baseline_positive_override_threshold": round(
                 float(0.70 if positive_override_threshold is None else positive_override_threshold), 4
             ),
@@ -1146,42 +1192,42 @@ At the end of Stage 1, internally fix three values before reading any Stage 2 in
 STAGE 2 — BASELINE-MODEL VERIFICATION
 =================================================================
 
-Now consult the baseline machine-learning model's prediction shown in the Stage 2 inputs. The baseline model was trained independently of the precedent retrieval and SHAP attribution pipeline, so its prediction is a largely independent signal. When both signals agree, the Stage 1 verdict is reliable. When they disagree, the resolution depends on how confident the baseline is.
+Now consult the baseline machine-learning model's prediction shown in the Stage 2 inputs. The baseline model was trained independently of the precedent retrieval and SHAP attribution pipeline, so its prediction is a largely independent signal. When both signals agree, the Stage 1 verdict is reliable. When they disagree, the resolution depends on baseline_positive_probability on a single positive-class probability axis.
 
 Critical clarifications before applying the rules:
 - baseline_predicted_outcome is a HARD CLASS LABEL (e.g., 0 or 1, "positive" or "negative"). It is not a probability. Use it only as a label.
-- baseline_confidence is a number between 0.50 and 1.00 that expresses how confident the baseline is in the class it predicted. A baseline_confidence of 0.5163 still means the baseline predicts its stated class — just weakly. It does NOT mean the baseline is undecided between classes.
-- "Agreement" is a strict equality check between two labels. It does not depend on any probability or confidence value. baseline_confidence near 0.50 does NOT make agreement false.
+- baseline_positive_probability is the baseline model's estimated probability of positive_class_label. Use this directional probability axis in Rule B and Rule C.
+- baseline_confidence is provided only as descriptive context for the baseline's predicted class; do not use baseline_confidence in the verification rules.
+- "Agreement" is a strict equality check between two labels. It does not depend on any probability or confidence value. A baseline probability near 0.50 does NOT make agreement false.
 
 Step 1 — Determine agreement.
 Compare two values:
 - stage1_verdict (the class label you fixed at the end of Stage 1; e.g., 1)
 - baseline_predicted_outcome (the class label provided in the Stage 2 input; e.g., 1)
 
-If these two labels are identical, then agreement = TRUE. If they are different, agreement = FALSE. Do not consult baseline_confidence or any other value when determining agreement.
+If these two labels are identical, then agreement = TRUE. If they are different, agreement = FALSE. Do not consult baseline_positive_probability, baseline_confidence, or any other value when determining agreement.
 
 Worked examples:
-- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_confidence = 0.52 → agreement = TRUE (both predict the same class; the low confidence does not change this).
-- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_confidence = 0.99 → agreement = TRUE.
-- stage1_verdict = 1, baseline_predicted_outcome = 0, baseline_confidence = 0.55 → agreement = FALSE.
-- stage1_verdict = 0, baseline_predicted_outcome = 1, baseline_confidence = 0.80 → agreement = FALSE.
+- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_positive_probability = 0.52 → agreement = TRUE.
+- stage1_verdict = 1, baseline_predicted_outcome = 1, baseline_positive_probability = 0.99 → agreement = TRUE.
+- stage1_verdict = 1, baseline_predicted_outcome = 0, baseline_positive_probability = 0.45 → agreement = FALSE.
+- stage1_verdict = 0, baseline_predicted_outcome = 1, baseline_positive_probability = 0.80 → agreement = FALSE.
 
-Step 2 — Compute baseline_p_positive (for output transparency only; do NOT use this in the verification rules).
-- If baseline_predicted_outcome equals positive_class_label, baseline_p_positive = baseline_confidence.
-- If baseline_predicted_outcome does not equal positive_class_label, baseline_p_positive = 1 - baseline_confidence.
+Step 2 — Use baseline_positive_probability.
+baseline_positive_probability is provided directly in the Stage 2 inputs. It is the baseline model's estimated probability of positive_class_label on a 0-to-1 scale. For output transparency, set baseline_p_positive equal to baseline_positive_probability.
 
 Step 3 — Apply the verification rules in order. Stop at the first rule that fires.
 
-Rule A — Agreement. If agreement is TRUE (as determined in Step 1), keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider baseline_confidence in this rule — agreement alone fires Rule A regardless of how confident or unconfident the baseline is.
-Rule B — Dataset-calibrated baseline override. If agreement is FALSE and baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_confidence is greater than the average baseline confidence among true positive cases in the holdout set multiplied by 0.8. If agreement is FALSE and baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_confidence is greater than the average baseline confidence among true negative cases in the holdout set multiplied by 0.9. final_confidence = moderate under override because two independent signals disagreed.
-Rule C — Dataset-calibrated keep Stage 1. If agreement is FALSE and baseline_confidence does not exceed the relevant true-positive or true-negative threshold, keep the Stage 1 verdict. Cap final_confidence at moderate: downgrade high to moderate, and leave moderate or low unchanged.
+Rule A — Agreement. If agreement is TRUE, keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider the baseline in this rule — agreement alone fires Rule A regardless of baseline probability.
+Rule B — Dataset-calibrated baseline override. If agreement is FALSE: if baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_positive_probability > positive_override_threshold_80th_percentile_true_negative_positive_probability. This threshold is the 80th-percentile positive-probability of true-negative cases in the holdout set and encodes an approximate 20% false-positive budget. If baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_positive_probability < negative_override_threshold_10th_percentile_true_positive_positive_probability. This threshold is the 10th-percentile positive-probability of true-positive cases in the holdout set and encodes an approximate 10% false-negative budget. On any override, set final_confidence = moderate, because two independent signals disagreed.
+Rule C — Dataset-calibrated keep Stage 1. If agreement is FALSE and baseline_positive_probability does not cross the relevant Rule B threshold, keep the Stage 1 verdict. Cap final_confidence at moderate: downgrade high to moderate, and leave moderate or low unchanged.
 
-Do not invoke any rule other than the three above. Do not override based on the Stage 1 rationale text or the Stage 1 confidence — only the agreement check, baseline_predicted_outcome, baseline_confidence, and the dataset-calibrated threshold for the baseline's predicted class drive the verification.
+Do not invoke any rule other than the three above. Do not override based on the Stage 1 rationale text or the Stage 1 confidence — only the agreement check, baseline_predicted_outcome, baseline_positive_probability, and the relevant dataset-calibrated probability threshold drive the verification.
 
 Final rationale composition:
-- If Rule A fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model agreed (state baseline_confidence). The note should affirm agreement even if baseline_confidence is low; a low-confidence agreement is still agreement.
-- If Rule B fired, the final rationale should keep the Stage 1 evidence summary but append a sentence explaining that the baseline model disagreed, exceeded the dataset-calibrated threshold for its predicted class, and that the verification step adopted the baseline verdict.
-- If Rule C fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model disagreed but did not exceed the dataset-calibrated threshold for its predicted class, so it was not strong enough to override.
+- If Rule A fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model agreed (state baseline_positive_probability).
+- If Rule B fired, the final rationale should keep the Stage 1 evidence summary but append a sentence explaining that the baseline model disagreed, crossed the relevant dataset-calibrated positive-probability threshold, and that the verification step adopted the baseline verdict.
+- If Rule C fired, the final rationale is the Stage 1 rationale, with a one-sentence note that the baseline model disagreed but baseline_positive_probability did not cross the relevant dataset-calibrated threshold, so it was not strong enough to override.
 
 =================================================================
 INPUTS
@@ -1208,11 +1254,12 @@ Precedent outcome counts:
 
 Baseline model output:
 - baseline_predicted_outcome: {baseline_predicted_outcome}
-- baseline_confidence: {baseline_confidence:.4f}
+- baseline_positive_probability: {baseline_positive_probability:.4f}
+- baseline_confidence_not_used_for_verification: {baseline_confidence:.4f}
 
 Dataset-calibrated baseline override thresholds:
-- positive_override_threshold_true_positive_mean_x_0_8: {positive_override_threshold:.4f}
-- negative_override_threshold_true_negative_mean_x_0_9: {negative_override_threshold:.4f}
+- positive_override_threshold_80th_percentile_true_negative_positive_probability: {positive_override_threshold:.4f}
+- negative_override_threshold_10th_percentile_true_positive_positive_probability: {negative_override_threshold:.4f}
 
 =================================================================
 OUTPUT
@@ -1225,6 +1272,7 @@ Return this JSON object:
   "stage1_rationale": "one detailed professional paragraph that (a) compares the holdout case with the retrieved precedents on the recurring top SHAP predictors, (b) states N, n_pos, and pos_share, and names which branch of the Stage 1 decision rule applied, (c) lists which structural-risk-checklist markers were checked and which triggered when applicable, and (d) explains how that combined evidence led to the Stage 1 verdict",
   "agreement": true | false,
   "baseline_p_positive": <numeric value between 0 and 1>,
+  "baseline_positive_probability": <numeric value between 0 and 1>,
   "verification_rule_applied": "A | B | C",
   "final_predicted_outcome": "one of the domain labels",
   "final_confidence_level": "low | moderate | high",
