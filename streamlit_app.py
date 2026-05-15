@@ -849,7 +849,7 @@ Step 3 — Apply the verification rules in order. Stop at the first rule that fi
 
 Rule A — Agreement. If agreement is TRUE, keep the Stage 1 verdict and confidence unchanged. final_verdict = stage1_verdict. final_confidence = stage1_confidence. Do not consider the baseline in this rule — agreement alone fires Rule A regardless of baseline probability.
 
-Rule B — Dataset-calibrated baseline override. If agreement is FALSE: if baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_positive_probability > positive_override_threshold_80th_percentile_true_negative_positive_probability. This threshold is the 80th-percentile positive-probability of true-negative cases in the holdout set and encodes an approximate 20% false-positive budget. If baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_positive_probability < negative_override_threshold_conservative_positive_probability_cutoff. This cutoff is the lower, more conservative value between the 80th-percentile positive-probability of true-negative cases and the 10th-percentile positive-probability of true-positive cases, so a negative override requires the baseline probability to be clearly in the negative range. On any override, set final_confidence = moderate, because two independent signals disagreed.
+Rule B — Dataset-calibrated baseline override. If agreement is FALSE: if baseline_predicted_outcome equals positive_class_label, override to the positive class only when baseline_positive_probability > positive_override_threshold_10th_percentile_true_positive_positive_probability. This threshold is the 10th-percentile positive-probability of true-positive cases correctly predicted by the baseline model, so a positive override requires the baseline probability to be in the range normally seen among true positives. If baseline_predicted_outcome does not equal positive_class_label, override to the negative class only when baseline_positive_probability < negative_override_threshold_80th_percentile_true_negative_positive_probability. This threshold is the 80th-percentile positive-probability of true-negative cases correctly predicted by the baseline model, so a negative override requires the baseline probability to be in the range normally seen among true negatives. On any override, set final_confidence = moderate, because two independent signals disagreed.
 
 Rule C — Dataset-calibrated keep Stage 1. If agreement is FALSE and baseline_positive_probability does not cross the relevant Rule B threshold, keep the Stage 1 verdict. Cap final_confidence at moderate: downgrade high to moderate, and leave moderate or low unchanged.
 
@@ -884,8 +884,8 @@ Baseline model output:
 - baseline_confidence_not_used_for_verification: {float(baseline_confidence):.4f}
 
 Dataset-calibrated baseline override thresholds:
-- positive_override_threshold_80th_percentile_true_negative_positive_probability: {positive_override_threshold:.4f}
-- negative_override_threshold_conservative_positive_probability_cutoff: {negative_override_threshold:.4f}
+- positive_override_threshold_10th_percentile_true_positive_positive_probability: {positive_override_threshold:.4f}
+- negative_override_threshold_80th_percentile_true_negative_positive_probability: {negative_override_threshold:.4f}
 
 =================================================================
 OUTPUT
